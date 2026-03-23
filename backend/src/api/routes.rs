@@ -103,8 +103,7 @@ pub fn create_router(state: SharedState) -> Router {
 
     // Only mount Swagger UI and OpenAPI spec in development or when explicitly enabled
     if swagger_enabled {
-        router = router
-            .merge(SwaggerUi::new("/swagger-ui").url("/api/v1/openapi.json", openapi));
+        router = router.merge(SwaggerUi::new("/swagger-ui").url("/api/v1/openapi.json", openapi));
     }
 
     let mut router = router

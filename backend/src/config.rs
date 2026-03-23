@@ -250,8 +250,7 @@ impl Config {
 
         if self.jwt_secret.len() < 32 {
             return Err(AppError::Config(
-                "JWT_SECRET must be at least 32 characters when ENVIRONMENT=production"
-                    .into(),
+                "JWT_SECRET must be at least 32 characters when ENVIRONMENT=production".into(),
             ));
         }
 

@@ -617,10 +617,7 @@ impl SamlService {
         if let Some(ref idp_cert_pem) = self.config.idp_certificate {
             let key = bergshamra::keys::loader::load_x509_cert_pem(idp_cert_pem.as_bytes())
                 .map_err(|e| {
-                    AppError::Authentication(format!(
-                        "Failed to parse IdP certificate: {}",
-                        e
-                    ))
+                    AppError::Authentication(format!("Failed to parse IdP certificate: {}", e))
                 })?;
 
             let mut keys_manager = bergshamra::KeysManager::new();
