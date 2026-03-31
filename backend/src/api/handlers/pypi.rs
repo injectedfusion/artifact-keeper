@@ -535,7 +535,8 @@ async fn serve_file(
                         state.db.clone(),
                         state.scanner_service.clone(),
                         repo.id,
-                        format!("packages/{}/{}", normalized, filename),
+                        repo_key.to_string(),
+                        local_cache_path.clone(),
                         project.to_string(),
                         filename
                             .split('-')

@@ -518,7 +518,8 @@ async fn serve_tarball(
                         state.db.clone(),
                         state.scanner_service.clone(),
                         repo.id,
-                        format!("{}/-/{}", package_name, filename),
+                        repo_key.to_string(),
+                        upstream_path.clone(),
                         package_name.to_string(),
                         filename
                             .strip_suffix(".tgz")

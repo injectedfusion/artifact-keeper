@@ -590,10 +590,18 @@ fn compute_sha256_hex(content: &Bytes) -> String {
 /// `artifact_path` is the logical path (e.g. "lodash/-/lodash-4.17.21.tgz").
 /// `name` and `version` are package-level identifiers extracted by the caller.
 /// `content_type` defaults to "application/octet-stream" if None.
+/// Register a proxy-fetched artifact in the `artifacts` table and optionally
+/// trigger a scan if `scan_on_proxy` is enabled for the repository.
+///
+/// `repo_key` is the repository key (e.g. "npm-remote") used by ProxyService
+/// to namespace the cache. `artifact_path` must match the path passed to
+/// `proxy_fetch` so the storage_key aligns with where ProxyService cached
+/// the content: `proxy-cache/{repo_key}/{path}/__content__`.
 pub fn register_proxied_artifact(
     db: PgPool,
     scanner_service: Option<Arc<ScannerService>>,
     repo_id: Uuid,
+    repo_key: String,
     artifact_path: String,
     name: String,
     version: String,
@@ -604,9 +612,10 @@ pub fn register_proxied_artifact(
         let size_bytes = content.len() as i64;
         let checksum = compute_sha256_hex(&content);
         let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-        // Use the proxy-cache storage key convention so the scanner can find
-        // the content via the same path the proxy service already cached it to.
-        let storage_key = format!("proxy-cache/{}", artifact_path);
+        // Match ProxyService::cache_storage_key format exactly:
+        // proxy-cache/{repo_key}/{path_trimmed}/__content__
+        let trimmed = artifact_path.trim_start_matches('/').trim_end_matches('/');
+        let storage_key = format!("proxy-cache/{}/{}/__content__", repo_key, trimmed);
 
         let result = sqlx::query_scalar::<_, Uuid>(
             r#"
