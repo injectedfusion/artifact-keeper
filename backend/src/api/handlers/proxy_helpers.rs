@@ -581,33 +581,30 @@ fn compute_sha256_hex(content: &Bytes) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Metadata for a proxy-fetched artifact to be registered in the DB.
+pub struct ProxiedArtifact {
+    pub db: PgPool,
+    pub scanner_service: Option<Arc<ScannerService>>,
+    pub repo_id: Uuid,
+    pub repo_key: String,
+    pub artifact_path: String,
+    pub name: String,
+    pub version: String,
+    pub content: Bytes,
+    pub content_type: Option<String>,
+}
+
 /// Register a proxy-fetched artifact in the `artifacts` table and optionally
 /// trigger a scan if `scan_on_proxy` is enabled for the repository.
 ///
-/// This is fire-and-forget: the caller does not need to await the result.
-/// Duplicate fetches of the same artifact are handled via ON CONFLICT DO NOTHING.
-///
-/// `artifact_path` is the logical path (e.g. "lodash/-/lodash-4.17.21.tgz").
-/// `name` and `version` are package-level identifiers extracted by the caller.
-/// `content_type` defaults to "application/octet-stream" if None.
-/// Register a proxy-fetched artifact in the `artifacts` table and optionally
-/// trigger a scan if `scan_on_proxy` is enabled for the repository.
-///
-/// `repo_key` is the repository key (e.g. "npm-remote") used by ProxyService
-/// to namespace the cache. `artifact_path` must match the path passed to
-/// `proxy_fetch` so the storage_key aligns with where ProxyService cached
-/// the content: `proxy-cache/{repo_key}/{path}/__content__`.
-pub fn register_proxied_artifact(
-    db: PgPool,
-    scanner_service: Option<Arc<ScannerService>>,
-    repo_id: Uuid,
-    repo_key: String,
-    artifact_path: String,
-    name: String,
-    version: String,
-    content: Bytes,
-    content_type: Option<String>,
-) {
+/// Fire-and-forget: spawns a background task, does not block the response.
+/// `artifact_path` must match the path passed to `proxy_fetch` so the
+/// storage_key aligns: `proxy-cache/{repo_key}/{path}/__content__`.
+pub fn register_proxied_artifact(artifact: ProxiedArtifact) {
+    let ProxiedArtifact {
+        db, scanner_service, repo_id, repo_key,
+        artifact_path, name, version, content, content_type,
+    } = artifact;
     tokio::spawn(async move {
         let size_bytes = content.len() as i64;
         let checksum = compute_sha256_hex(&content);

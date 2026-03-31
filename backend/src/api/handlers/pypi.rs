@@ -531,14 +531,14 @@ async fn serve_file(
                     )
                     .await?;
 
-                    proxy_helpers::register_proxied_artifact(
-                        state.db.clone(),
-                        state.scanner_service.clone(),
-                        repo.id,
-                        repo_key.to_string(),
-                        local_cache_path.clone(),
-                        project.to_string(),
-                        filename
+                    proxy_helpers::register_proxied_artifact(proxy_helpers::ProxiedArtifact {
+                        db: state.db.clone(),
+                        scanner_service: state.scanner_service.clone(),
+                        repo_id: repo.id,
+                        repo_key: repo_key.to_string(),
+                        artifact_path: local_cache_path.clone(),
+                        name: project.to_string(),
+                        version: filename
                             .split('-')
                             .nth(1)
                             .and_then(|s| {
@@ -548,9 +548,9 @@ async fn serve_file(
                             })
                             .unwrap_or("")
                             .to_string(),
-                        content.clone(),
-                        Some(pypi_content_type(filename).to_string()),
-                    );
+                        content: content.clone(),
+                        content_type: Some(pypi_content_type(filename).to_string()),
+                    });
 
                     return Ok(build_file_response(filename, content));
                 }

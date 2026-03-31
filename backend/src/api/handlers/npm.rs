@@ -514,21 +514,21 @@ async fn serve_tarball(
                     )
                     .await?;
 
-                    proxy_helpers::register_proxied_artifact(
-                        state.db.clone(),
-                        state.scanner_service.clone(),
-                        repo.id,
-                        repo_key.to_string(),
-                        upstream_path.clone(),
-                        package_name.to_string(),
-                        filename
+                    proxy_helpers::register_proxied_artifact(proxy_helpers::ProxiedArtifact {
+                        db: state.db.clone(),
+                        scanner_service: state.scanner_service.clone(),
+                        repo_id: repo.id,
+                        repo_key: repo_key.to_string(),
+                        artifact_path: upstream_path.clone(),
+                        name: package_name.to_string(),
+                        version: filename
                             .strip_suffix(".tgz")
                             .and_then(|s| s.rsplit_once('-'))
                             .map(|(_, v)| v.to_string())
                             .unwrap_or_default(),
-                        content.clone(),
-                        Some("application/gzip".to_string()),
-                    );
+                        content: content.clone(),
+                        content_type: Some("application/gzip".to_string()),
+                    });
 
                     return Ok(Response::builder()
                         .status(StatusCode::OK)

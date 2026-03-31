@@ -692,17 +692,17 @@ async fn download(
                     )
                     .await?;
 
-                    proxy_helpers::register_proxied_artifact(
-                        state.db.clone(),
-                        state.scanner_service.clone(),
-                        repo.id,
-                        repo_key.to_string(),
-                        upstream_path.clone(),
-                        name_lower.to_string(),
-                        version.to_string(),
-                        content.clone(),
-                        Some("application/gzip".to_string()),
-                    );
+                    proxy_helpers::register_proxied_artifact(proxy_helpers::ProxiedArtifact {
+                        db: state.db.clone(),
+                        scanner_service: state.scanner_service.clone(),
+                        repo_id: repo.id,
+                        repo_key: repo_key.to_string(),
+                        artifact_path: upstream_path.clone(),
+                        name: name_lower.to_string(),
+                        version: version.to_string(),
+                        content: content.clone(),
+                        content_type: Some("application/gzip".to_string()),
+                    });
 
                     let filename = format!("{}-{}.crate", name_lower, version);
 
