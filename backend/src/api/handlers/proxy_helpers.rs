@@ -7,7 +7,7 @@ use chrono::Utc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::api::AppState;
@@ -602,8 +602,15 @@ pub struct ProxiedArtifact {
 /// storage_key aligns: `proxy-cache/{repo_key}/{path}/__content__`.
 pub fn register_proxied_artifact(artifact: ProxiedArtifact) {
     let ProxiedArtifact {
-        db, scanner_service, repo_id, repo_key,
-        artifact_path, name, version, content, content_type,
+        db,
+        scanner_service,
+        repo_id,
+        repo_key,
+        artifact_path,
+        name,
+        version,
+        content,
+        content_type,
     } = artifact;
     tokio::spawn(async move {
         let size_bytes = content.len() as i64;
