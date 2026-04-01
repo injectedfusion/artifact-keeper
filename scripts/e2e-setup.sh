@@ -132,8 +132,9 @@ done
 
 echo "==> Setup complete"
 
-# In Docker container mode, signal healthcheck and keep alive
-if [ -f /.dockerenv ] || [ -n "$DOCKER_CONTAINER" ]; then
+# In container mode, signal healthcheck and keep alive
+# Check /.dockerenv (Docker), /run/.containerenv (Podman), or DOCKER_CONTAINER env
+if [ -f /.dockerenv ] || [ -f /run/.containerenv ] || [ -n "$DOCKER_CONTAINER" ]; then
   touch /tmp/.setup-done
   tail -f /dev/null
 fi
