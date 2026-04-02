@@ -278,14 +278,22 @@ jobs:
       - name: Wait for tests to complete
         run: |
           echo "Waiting for test containers to finish..."
-          timeout 480 docker wait e2e-test-pypi e2e-test-npm e2e-test-cargo e2e-test-proxy-virtual || {
-            echo "ERROR: Tests timed out. Container statuses:"
-            docker ps -a --filter "name=e2e-test" --format "table {{.Names}}\t{{.Status}}"
-            echo ""
-            echo "Backend logs (last 50 lines):"
-            docker logs e2e-test-backend --tail 50 2>&1 || true
-            exit 1
-          }
+          docker wait e2e-test-pypi e2e-test-npm e2e-test-cargo e2e-test-proxy-virtual &
+          WAIT_PID=$!
+          DEADLINE=$((SECONDS + 480))
+          while kill -0 "$WAIT_PID" 2>/dev/null; do
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              kill "$WAIT_PID" 2>/dev/null
+              echo "ERROR: Tests timed out. Container statuses:"
+              docker ps -a --filter "name=e2e-test" --format "table {{.Names}}\t{{.Status}}"
+              echo ""
+              echo "Backend logs (last 50 lines):"
+              docker logs e2e-test-backend --tail 50 2>&1 || true
+              exit 1
+            fi
+            sleep 5
+          done
+          wait "$WAIT_PID"
 
       - name: Show test results
         if: always()
