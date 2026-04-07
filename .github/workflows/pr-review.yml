@@ -26,8 +26,14 @@ jobs:
         env:
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           THIS_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "$PR_HEAD_REPO" = "$THIS_REPO" ]; then
+          # issue_comment and pull_request_review_comment events don't have
+          # pull_request.head.repo, so treat them as internal (secrets won't
+          # be available for fork PRs anyway).
+          if [ "$EVENT_NAME" = "issue_comment" ] || [ "$EVENT_NAME" = "pull_request_review_comment" ]; then
+            echo "is_internal=true" >> "$GITHUB_OUTPUT"
+          elif [ "$PR_HEAD_REPO" = "$THIS_REPO" ]; then
             echo "is_internal=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_internal=false" >> "$GITHUB_OUTPUT"
