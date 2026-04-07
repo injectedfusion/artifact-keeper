@@ -1,0 +1,119 @@
+name: PR Review
+
+# SECURITY: Only trigger on internal PRs (same repo), never on fork PRs.
+# Fork PRs cannot access secrets and should not run CI that builds/deploys.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+
+# Minimal permissions. Each job escalates only what it needs.
+permissions:
+  contents: read
+
+jobs:
+  # Gate: skip everything if PR is from a fork
+  check-origin:
+    runs-on: ubuntu-latest
+    outputs:
+      is_internal: ${{ steps.check.outputs.is_internal }}
+    steps:
+      - id: check
+        env:
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # issue_comment and pull_request_review_comment events don't have
+          # pull_request.head.repo, so treat them as internal (secrets won't
+          # be available for fork PRs anyway).
+          if [ "$EVENT_NAME" = "issue_comment" ] || [ "$EVENT_NAME" = "pull_request_review_comment" ]; then
+            echo "is_internal=true" >> "$GITHUB_OUTPUT"
+          elif [ "$PR_HEAD_REPO" = "$THIS_REPO" ]; then
+            echo "is_internal=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_internal=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Skipping CI for fork PR"
+          fi
+
+  # Rust compilation check (no tests that need DB)
+  cargo-check:
+    needs: check-origin
+    if: needs.check-origin.outputs.is_internal == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab  # v2.7.5
+        with:
+          workspaces: backend
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b  # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: cargo check
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo check -p artifact-keeper-backend
+
+      - name: cargo test (unit only)
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo test -p artifact-keeper-backend --lib
+
+  # Claude Code review + auto-merge
+  review:
+    needs: [check-origin, cargo-check]
+    if: |
+      always() &&
+      needs.check-origin.outputs.is_internal == 'true' &&
+      (
+        (github.event_name == 'pull_request' && needs.cargo-check.result != 'failure') ||
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@ff9acae5886d41a99ed4ec14b7dc147d55834722  # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          track_progress: true
+          prompt: |
+            Review this PR for:
+            - Rust correctness (unsafe, error handling, resource leaks)
+            - SQL injection or query safety (sqlx compile-time checks should cover most)
+            - Security implications (auth bypass, SSRF via proxy, path traversal)
+            - Performance (unnecessary clones, blocking in async, N+1 queries)
+
+            After your review:
+            - Use inline comments for specific code issues.
+            - Post a single PR comment with your overall summary.
+            - If the PR is acceptable: approve it with `gh pr review --approve` and
+              then merge it with `gh pr merge --squash --auto`.
+            - If the PR has issues that must be fixed: request changes with
+              `gh pr review --request-changes` and do NOT merge.
+
+          claude_args: |
+            --model claude-haiku-4-5-20251001 --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(gh pr merge:*)"

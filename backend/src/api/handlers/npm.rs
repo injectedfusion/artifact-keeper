@@ -498,7 +498,90 @@ async fn serve_tarball(
 
     let artifact = match artifact {
         Some(a) => a,
-        None => return Err(AppError::NotFound("Tarball not found".to_string()).into_response()),
+        None => {
+            if repo.repo_type == RepositoryType::Remote {
+                if let (Some(ref upstream_url), Some(ref proxy)) =
+                    (&repo.upstream_url, &state.proxy_service)
+                {
+                    // Upstream path: {package_name}/-/{filename}
+                    let upstream_path = format!("{}/-/{}", package_name, filename);
+                    let (content, _content_type) = proxy_helpers::proxy_fetch(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        &upstream_path,
+                    )
+                    .await?;
+
+                    proxy_helpers::register_proxied_artifact(proxy_helpers::ProxiedArtifact {
+                        db: state.db.clone(),
+                        scanner_service: state.scanner_service.clone(),
+                        repo_id: repo.id,
+                        repo_key: repo_key.to_string(),
+                        artifact_path: upstream_path.clone(),
+                        name: package_name.to_string(),
+                        version: filename
+                            .strip_suffix(".tgz")
+                            .and_then(|s| s.rsplit_once('-'))
+                            .map(|(_, v)| v.to_string())
+                            .unwrap_or_default(),
+                        content: content.clone(),
+                        content_type: Some("application/gzip".to_string()),
+                    });
+
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/octet-stream")
+                        .header(
+                            "Content-Disposition",
+                            format!("attachment; filename=\"{}\"", filename),
+                        )
+                        .header(CONTENT_LENGTH, content.len().to_string())
+                        .body(Body::from(content))
+                        .unwrap());
+                }
+            }
+            // Virtual repo: try each member in priority order
+            if repo.repo_type == RepositoryType::Virtual {
+                let db = state.db.clone();
+                let fname = filename.to_string();
+                let upstream_path = format!("{}/-/{}", package_name, filename);
+                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                    &state.db,
+                    state.proxy_service.as_deref(),
+                    repo.id,
+                    &upstream_path,
+                    |member_id, location| {
+                        let db = db.clone();
+                        let state = state.clone();
+                        let fname = fname.clone();
+                        async move {
+                            proxy_helpers::local_fetch_by_path_suffix(
+                                &db, &state, member_id, &location, &fname,
+                            )
+                            .await
+                        }
+                    },
+                )
+                .await?;
+
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        CONTENT_TYPE,
+                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                    )
+                    .header(
+                        "Content-Disposition",
+                        format!("attachment; filename=\"{}\"", filename),
+                    )
+                    .header(CONTENT_LENGTH, content.len().to_string())
+                    .body(Body::from(content))
+                    .unwrap());
+            }
+            return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
+        }
     };
 
     // Read from storage
