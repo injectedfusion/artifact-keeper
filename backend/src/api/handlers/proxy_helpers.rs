@@ -16,7 +16,7 @@ use crate::models::repository::{
 };
 use crate::services::proxy_service::ProxyService;
 use crate::services::scanner_service::ScannerService;
-use crate::storage::StorageLocation;
+use crate::storage::{StorageBackend, StorageLocation};
 
 // ---------------------------------------------------------------------------
 // Shared RepoInfo
@@ -605,7 +605,7 @@ pub fn register_proxied_artifact(artifact: ProxiedArtifact) {
         db,
         scanner_service,
         repo_id,
-        repo_key,
+        repo_key: _,
         artifact_path,
         name,
         version,
@@ -616,10 +616,32 @@ pub fn register_proxied_artifact(artifact: ProxiedArtifact) {
         let size_bytes = content.len() as i64;
         let checksum = compute_sha256_hex(&content);
         let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-        // Match ProxyService::cache_storage_key format exactly:
-        // proxy-cache/{repo_key}/{path_trimmed}/__content__
+        // Use the artifact path as the storage key. Write a copy of the
+        // content into the repo's own FilesystemStorage so that
+        // QualityCheckService and ScannerService can read it back through
+        // the same key_to_path resolution (2-char prefix sharding).
         let trimmed = artifact_path.trim_start_matches('/').trim_end_matches('/');
-        let storage_key = format!("proxy-cache/{}/{}/__content__", repo_key, trimmed);
+        let storage_key = trimmed.to_string();
+
+        // Write content to repo storage for scanners to read
+        let storage_path: Option<String> = sqlx::query_scalar(
+            "SELECT storage_path FROM repositories WHERE id = $1",
+        )
+        .bind(repo_id)
+        .fetch_optional(&db)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(ref sp) = storage_path {
+            let storage = crate::storage::filesystem::FilesystemStorage::new(sp);
+            if let Err(e) = storage.put(&storage_key, content.clone()).await {
+                tracing::warn!(
+                    "Failed to write proxied artifact to repo storage: {}",
+                    e
+                );
+            }
+        }
 
         let result = sqlx::query_scalar::<_, Uuid>(
             r#"
