@@ -16,7 +16,7 @@ use crate::models::repository::{
 };
 use crate::services::proxy_service::ProxyService;
 use crate::services::scanner_service::ScannerService;
-use crate::storage::{StorageBackend, StorageLocation};
+use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
 
 // ---------------------------------------------------------------------------
 // Shared RepoInfo
@@ -585,6 +585,7 @@ fn compute_sha256_hex(content: &Bytes) -> String {
 pub struct ProxiedArtifact {
     pub db: PgPool,
     pub scanner_service: Option<Arc<ScannerService>>,
+    pub storage_registry: Arc<StorageRegistry>,
     pub repo_id: Uuid,
     pub repo_key: String,
     pub artifact_path: String,
@@ -604,6 +605,7 @@ pub fn register_proxied_artifact(artifact: ProxiedArtifact) {
     let ProxiedArtifact {
         db,
         scanner_service,
+        storage_registry,
         repo_id,
         repo_key: _,
         artifact_path,
@@ -623,19 +625,41 @@ pub fn register_proxied_artifact(artifact: ProxiedArtifact) {
         let trimmed = artifact_path.trim_start_matches('/').trim_end_matches('/');
         let storage_key = trimmed.to_string();
 
-        // Write content to repo storage for scanners to read
-        let storage_path: Option<String> =
-            sqlx::query_scalar("SELECT storage_path FROM repositories WHERE id = $1")
-                .bind(repo_id)
-                .fetch_optional(&db)
-                .await
-                .ok()
-                .flatten();
+        // Write content to repo storage for scanners to read.
+        // Query both backend and path so we can dynamically resolve the correct storage backend.
+        use sqlx::Row;
+        let row = sqlx::query("SELECT storage_backend, storage_path FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .fetch_optional(&db)
+            .await;
 
-        if let Some(ref sp) = storage_path {
-            let storage = crate::storage::filesystem::FilesystemStorage::new(sp);
-            if let Err(e) = storage.put(&storage_key, content.clone()).await {
-                tracing::warn!("Failed to write proxied artifact to repo storage: {}", e);
+        match row {
+            Ok(Some(row)) => {
+                let backend: String = row.try_get("storage_backend").unwrap_or_default();
+                let path: String = row.try_get("storage_path").unwrap_or_default();
+                let location = StorageLocation {
+                    backend,
+                    path,
+                };
+
+                // Resolve the storage backend dynamically using the registry,
+                // which supports S3, GCS, Azure, and filesystem backends.
+                match storage_registry.backend_for(&location) {
+                    Ok(storage) => {
+                        if let Err(e) = storage.put(&storage_key, content.clone()).await {
+                            tracing::warn!("Failed to write proxied artifact to repo storage: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to resolve storage backend for repo {}: {}", repo_id, e);
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::warn!("Repository {} not found; skipping proxied artifact storage", repo_id);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch storage location for repo {}: {}", repo_id, e);
             }
         }
 
