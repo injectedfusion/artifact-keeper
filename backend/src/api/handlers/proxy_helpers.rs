@@ -599,8 +599,10 @@ pub struct ProxiedArtifact {
 /// trigger a scan if `scan_on_proxy` is enabled for the repository.
 ///
 /// Fire-and-forget: spawns a background task, does not block the response.
-/// `artifact_path` must match the path passed to `proxy_fetch` so the
-/// storage_key aligns: `proxy-cache/{repo_key}/{path}/__content__`.
+/// `artifact_path` must match the path passed to `proxy_fetch`. The artifact
+/// is written to repo storage (S3, GCS, Azure, or filesystem) using the trimmed
+/// path as the storage key, allowing scanners to resolve it via the repository's
+/// normal key_to_path resolution (including 2-char prefix sharding).
 pub fn register_proxied_artifact(artifact: ProxiedArtifact) {
     let ProxiedArtifact {
         db,
