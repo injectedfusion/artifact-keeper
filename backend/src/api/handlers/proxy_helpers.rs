@@ -624,22 +624,18 @@ pub fn register_proxied_artifact(artifact: ProxiedArtifact) {
         let storage_key = trimmed.to_string();
 
         // Write content to repo storage for scanners to read
-        let storage_path: Option<String> = sqlx::query_scalar(
-            "SELECT storage_path FROM repositories WHERE id = $1",
-        )
-        .bind(repo_id)
-        .fetch_optional(&db)
-        .await
-        .ok()
-        .flatten();
+        let storage_path: Option<String> =
+            sqlx::query_scalar("SELECT storage_path FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_optional(&db)
+                .await
+                .ok()
+                .flatten();
 
         if let Some(ref sp) = storage_path {
             let storage = crate::storage::filesystem::FilesystemStorage::new(sp);
             if let Err(e) = storage.put(&storage_key, content.clone()).await {
-                tracing::warn!(
-                    "Failed to write proxied artifact to repo storage: {}",
-                    e
-                );
+                tracing::warn!("Failed to write proxied artifact to repo storage: {}", e);
             }
         }
 
