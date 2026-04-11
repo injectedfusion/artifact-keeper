@@ -16,7 +16,7 @@ use crate::models::repository::{
 };
 use crate::services::proxy_service::ProxyService;
 use crate::services::scanner_service::ScannerService;
-use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
+use crate::storage::{StorageLocation, StorageRegistry};
 
 // ---------------------------------------------------------------------------
 // Shared RepoInfo
@@ -628,38 +628,50 @@ pub fn register_proxied_artifact(artifact: ProxiedArtifact) {
         // Write content to repo storage for scanners to read.
         // Query both backend and path so we can dynamically resolve the correct storage backend.
         use sqlx::Row;
-        let row = sqlx::query("SELECT storage_backend, storage_path FROM repositories WHERE id = $1")
-            .bind(repo_id)
-            .fetch_optional(&db)
-            .await;
+        let row =
+            sqlx::query("SELECT storage_backend, storage_path FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_optional(&db)
+                .await;
 
         match row {
             Ok(Some(row)) => {
                 let backend: String = row.try_get("storage_backend").unwrap_or_default();
                 let path: String = row.try_get("storage_path").unwrap_or_default();
-                let location = StorageLocation {
-                    backend,
-                    path,
-                };
+                let location = StorageLocation { backend, path };
 
                 // Resolve the storage backend dynamically using the registry,
                 // which supports S3, GCS, Azure, and filesystem backends.
                 match storage_registry.backend_for(&location) {
                     Ok(storage) => {
                         if let Err(e) = storage.put(&storage_key, content.clone()).await {
-                            tracing::warn!("Failed to write proxied artifact to repo storage: {}", e);
+                            tracing::warn!(
+                                "Failed to write proxied artifact to repo storage: {}",
+                                e
+                            );
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to resolve storage backend for repo {}: {}", repo_id, e);
+                        tracing::warn!(
+                            "Failed to resolve storage backend for repo {}: {}",
+                            repo_id,
+                            e
+                        );
                     }
                 }
             }
             Ok(None) => {
-                tracing::warn!("Repository {} not found; skipping proxied artifact storage", repo_id);
+                tracing::warn!(
+                    "Repository {} not found; skipping proxied artifact storage",
+                    repo_id
+                );
             }
             Err(e) => {
-                tracing::warn!("Failed to fetch storage location for repo {}: {}", repo_id, e);
+                tracing::warn!(
+                    "Failed to fetch storage location for repo {}: {}",
+                    repo_id,
+                    e
+                );
             }
         }
 
