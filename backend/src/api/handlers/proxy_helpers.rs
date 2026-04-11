@@ -16,7 +16,7 @@ use crate::models::repository::{
 };
 use crate::services::proxy_service::ProxyService;
 use crate::services::scanner_service::ScannerService;
-use crate::storage::StorageLocation;
+use crate::storage::{StorageLocation, StorageRegistry};
 
 // ---------------------------------------------------------------------------
 // Shared RepoInfo
@@ -585,6 +585,7 @@ fn compute_sha256_hex(content: &Bytes) -> String {
 pub struct ProxiedArtifact {
     pub db: PgPool,
     pub scanner_service: Option<Arc<ScannerService>>,
+    pub storage_registry: Arc<StorageRegistry>,
     pub repo_id: Uuid,
     pub repo_key: String,
     pub artifact_path: String,
@@ -598,14 +599,17 @@ pub struct ProxiedArtifact {
 /// trigger a scan if `scan_on_proxy` is enabled for the repository.
 ///
 /// Fire-and-forget: spawns a background task, does not block the response.
-/// `artifact_path` must match the path passed to `proxy_fetch` so the
-/// storage_key aligns: `proxy-cache/{repo_key}/{path}/__content__`.
+/// `artifact_path` must match the path passed to `proxy_fetch`. The artifact
+/// is written to repo storage (S3, GCS, Azure, or filesystem) using the trimmed
+/// path as the storage key, allowing scanners to resolve it via the repository's
+/// normal key_to_path resolution (including 2-char prefix sharding).
 pub fn register_proxied_artifact(artifact: ProxiedArtifact) {
     let ProxiedArtifact {
         db,
         scanner_service,
+        storage_registry,
         repo_id,
-        repo_key,
+        repo_key: _,
         artifact_path,
         name,
         version,
@@ -616,10 +620,62 @@ pub fn register_proxied_artifact(artifact: ProxiedArtifact) {
         let size_bytes = content.len() as i64;
         let checksum = compute_sha256_hex(&content);
         let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-        // Match ProxyService::cache_storage_key format exactly:
-        // proxy-cache/{repo_key}/{path_trimmed}/__content__
+        // Use the artifact path as the storage key. Write a copy of the
+        // content into the repo's own FilesystemStorage so that
+        // QualityCheckService and ScannerService can read it back through
+        // the same key_to_path resolution (2-char prefix sharding).
         let trimmed = artifact_path.trim_start_matches('/').trim_end_matches('/');
-        let storage_key = format!("proxy-cache/{}/{}/__content__", repo_key, trimmed);
+        let storage_key = trimmed.to_string();
+
+        // Write content to repo storage for scanners to read.
+        // Query both backend and path so we can dynamically resolve the correct storage backend.
+        use sqlx::Row;
+        let row =
+            sqlx::query("SELECT storage_backend, storage_path FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_optional(&db)
+                .await;
+
+        match row {
+            Ok(Some(row)) => {
+                let backend: String = row.try_get("storage_backend").unwrap_or_default();
+                let path: String = row.try_get("storage_path").unwrap_or_default();
+                let location = StorageLocation { backend, path };
+
+                // Resolve the storage backend dynamically using the registry,
+                // which supports S3, GCS, Azure, and filesystem backends.
+                match storage_registry.backend_for(&location) {
+                    Ok(storage) => {
+                        if let Err(e) = storage.put(&storage_key, content.clone()).await {
+                            tracing::warn!(
+                                "Failed to write proxied artifact to repo storage: {}",
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to resolve storage backend for repo {}: {}",
+                            repo_id,
+                            e
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "Repository {} not found; skipping proxied artifact storage",
+                    repo_id
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to fetch storage location for repo {}: {}",
+                    repo_id,
+                    e
+                );
+            }
+        }
 
         let result = sqlx::query_scalar::<_, Uuid>(
             r#"

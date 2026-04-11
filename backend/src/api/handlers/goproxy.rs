@@ -609,6 +609,7 @@ async fn download_zip(
                     proxy_helpers::register_proxied_artifact(proxy_helpers::ProxiedArtifact {
                         db: state.db.clone(),
                         scanner_service: state.scanner_service.clone(),
+                        storage_registry: state.storage_registry.clone(),
                         repo_id: repo.id,
                         repo_key: repo.key.clone(),
                         artifact_path: upstream_path.clone(),
