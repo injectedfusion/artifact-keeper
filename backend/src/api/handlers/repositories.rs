@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
@@ -19,12 +20,14 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::formats::maven::MavenHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::repository_service::{
     CreateRepositoryRequest as ServiceCreateRepoReq, RepositoryService,
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
+use crate::services::routing_rules::{self, RoutingRule};
 
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -70,23 +73,38 @@ fn require_visible(
     }
 }
 
+/// Generic upsert helper for repository_config key-value pairs.
+///
+/// Inserts a new row or updates an existing one for the given repository and
+/// config key. Used by multiple update paths (index_upstream_url, quarantine
+/// settings, etc.).
+async fn upsert_repo_config(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO repository_config (repository_id, key, value) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (repository_id, key) DO UPDATE SET value = $3, updated_at = NOW()",
+    )
+    .bind(repo_id)
+    .bind(key)
+    .bind(value)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
 /// Upsert the `index_upstream_url` key in `repository_config` for a given repository.
 async fn upsert_index_upstream_url(
     db: &sqlx::PgPool,
     repo_id: Uuid,
     index_url: &str,
 ) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO repository_config (repository_id, key, value) \
-         VALUES ($1, 'index_upstream_url', $2) \
-         ON CONFLICT (repository_id, key) DO UPDATE SET value = $2, updated_at = NOW()",
-    )
-    .bind(repo_id)
-    .bind(index_url)
-    .execute(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(())
+    upsert_repo_config(db, repo_id, "index_upstream_url", index_url).await
 }
 
 /// Create repository routes
@@ -103,6 +121,13 @@ pub fn router() -> Router<SharedState> {
         )
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
+        // Routing rules for path rewriting on remote repositories
+        .route(
+            "/:key/routing-rules",
+            get(get_routing_rules)
+                .post(set_routing_rules)
+                .delete(delete_routing_rules),
+        )
         // Upstream auth management for remote repositories
         .route("/:key/upstream-auth", put(set_upstream_auth))
         .route("/:key/test-upstream", post(test_upstream))
@@ -132,6 +157,10 @@ pub fn router() -> Router<SharedState> {
         .merge(super::security::repo_security_router())
         // Label routes nested under repository
         .merge(super::repository_labels::repo_labels_router())
+        // Token management routes nested under repository
+        .merge(super::repo_tokens::repo_tokens_router())
+        // Notification subscription routes nested under repository
+        .merge(super::notifications::repo_notifications_router())
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -197,6 +226,19 @@ pub struct UpdateRepositoryRequest {
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
+    /// Enable or disable quarantine period for this repository.
+    /// When enabled, newly uploaded artifacts are held until scanned.
+    /// Stored in `repository_config` under `quarantine_enabled`.
+    pub quarantine_enabled: Option<bool>,
+    /// Quarantine hold duration in minutes for this repository.
+    /// Stored in `repository_config` under `quarantine_duration_minutes`.
+    pub quarantine_duration_minutes: Option<i64>,
+    /// Link this staging repository to a release (local) repository.
+    /// Promotions from this staging repo will default to the linked release repo,
+    /// and promotions to any other repo will be rejected.
+    /// Pass an empty string to remove the link.
+    /// Stored in `repository_config` under `release_repository_id`.
+    pub release_repository_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -782,6 +824,65 @@ pub async fn update_repository(
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
 
+    if let Some(enabled) = payload.quarantine_enabled {
+        upsert_repo_config(
+            &state.db,
+            repo.id,
+            "quarantine_enabled",
+            if enabled { "true" } else { "false" },
+        )
+        .await?;
+    }
+
+    if let Some(duration) = payload.quarantine_duration_minutes {
+        if duration < 0 {
+            return Err(AppError::Validation(
+                "quarantine_duration_minutes must be non-negative".to_string(),
+            ));
+        }
+        upsert_repo_config(
+            &state.db,
+            repo.id,
+            "quarantine_duration_minutes",
+            &duration.to_string(),
+        )
+        .await?;
+    }
+
+    // Handle release repository linking for staging repos
+    if let Some(ref release_key) = payload.release_repository_key {
+        if release_key.is_empty() {
+            // Remove the link
+            sqlx::query(
+                "DELETE FROM repository_config WHERE repository_id = $1 AND key = 'release_repository_id'",
+            )
+            .bind(repo.id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        } else {
+            if repo.repo_type != RepositoryType::Staging {
+                return Err(AppError::Validation(
+                    "Release target linking is only available for staging repositories".to_string(),
+                ));
+            }
+
+            let release_repo = service.get_by_key(release_key).await.map_err(|_| {
+                AppError::Validation(format!("Release repository '{}' not found", release_key))
+            })?;
+
+            super::promotion::validate_release_target_link(&repo, &release_repo)?;
+
+            upsert_repo_config(
+                &state.db,
+                repo.id,
+                "release_repository_id",
+                &release_repo.id.to_string(),
+            )
+            .await?;
+        }
+    }
+
     let storage_used = service.get_storage_usage(repo.id).await?;
 
     state
@@ -832,6 +933,10 @@ pub struct ListArtifactsQuery {
     pub per_page: Option<u32>,
     pub q: Option<String>,
     pub path_prefix: Option<String>,
+    /// When set to `maven_component`, Maven/Gradle artifacts are grouped by
+    /// groupId, artifactId, and version.  Individual files (jar, pom, checksums)
+    /// appear in the `artifact_files` array of each component.
+    pub group_by: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -854,6 +959,37 @@ pub struct ArtifactResponse {
 pub struct ArtifactListResponse {
     pub items: Vec<ArtifactResponse>,
     pub pagination: Pagination,
+    /// Maven component grouping.  Only present when `group_by=maven_component`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub components: Option<Vec<MavenComponentResponse>>,
+}
+
+/// A Maven component grouped by GAV (groupId, artifactId, version).
+///
+/// Each component collects the individual files (jar, pom, checksums, etc.)
+/// that share the same Maven coordinates.
+#[derive(Debug, Serialize, ToSchema, Clone)]
+pub struct MavenComponentResponse {
+    /// Representative artifact ID (the first file in the group).
+    pub id: Uuid,
+    /// Maven groupId with dots (e.g. `org.junit.jupiter`).
+    pub group_id: String,
+    /// Maven artifactId (e.g. `junit-jupiter-api`).
+    pub artifact_id: String,
+    /// Maven version string (e.g. `5.11.0`).
+    pub version: String,
+    /// Repository key this component belongs to.
+    pub repository_key: String,
+    /// Repository format (always `maven` or `gradle`).
+    pub format: String,
+    /// Total size in bytes across all files in this component.
+    pub size_bytes: i64,
+    /// Total download count across all files in this component.
+    pub download_count: i64,
+    /// Earliest creation timestamp among the component files.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Individual filenames belonging to this component.
+    pub artifact_files: Vec<String>,
 }
 
 /// List artifacts in repository
@@ -887,6 +1023,27 @@ pub async fn list_artifacts(
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
+
+    let is_maven_format = matches!(
+        repo.format,
+        RepositoryFormat::Maven | RepositoryFormat::Gradle
+    );
+    let want_component_grouping =
+        query.group_by.as_deref() == Some("maven_component") && is_maven_format;
+
+    if want_component_grouping {
+        return list_artifacts_grouped_by_maven_component(
+            &artifact_service,
+            &state,
+            &repo,
+            &key,
+            query.path_prefix.as_deref(),
+            query.q.as_deref(),
+            page,
+            per_page,
+        )
+        .await;
+    }
 
     let (artifacts, total) = if repo.repo_type == RepositoryType::Virtual {
         // For virtual repositories, aggregate artifacts from all member repos.
@@ -954,7 +1111,146 @@ pub async fn list_artifacts(
             total,
             total_pages,
         },
+        components: None,
     }))
+}
+
+/// Build a grouped-by-component response for Maven/Gradle repositories.
+///
+/// Fetches all matching artifacts (up to 10 000), groups them by Maven GAV
+/// coordinates (groupId, artifactId, version), then paginates the resulting
+/// component list.  Files that cannot be parsed as Maven coordinates (e.g.
+/// top-level metadata) are silently skipped.
+#[allow(clippy::too_many_arguments)]
+async fn list_artifacts_grouped_by_maven_component(
+    artifact_service: &ArtifactService,
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    repo_key: &str,
+    path_prefix: Option<&str>,
+    search_query: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Result<Json<ArtifactListResponse>> {
+    // Fetch a large batch so we can group in-memory.  10 000 individual files
+    // is generous; most Maven repos have far fewer cached artifacts.
+    const MAX_FETCH: i64 = 10_000;
+
+    let (artifacts, _total_files) = if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
+            .await
+            .map_err(|_| {
+                AppError::Internal("Failed to resolve virtual repository members".to_string())
+            })?;
+        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+        artifact_service
+            .list_for_repos(&member_ids, path_prefix, search_query, 0, MAX_FETCH)
+            .await?
+    } else {
+        artifact_service
+            .list(repo.id, path_prefix, search_query, 0, MAX_FETCH)
+            .await?
+    };
+
+    let artifact_ids: Vec<Uuid> = artifacts.iter().map(|a| a.id).collect();
+    let download_counts = artifact_service
+        .get_download_stats_batch(&artifact_ids)
+        .await?;
+
+    let components = group_maven_artifacts(
+        &artifacts,
+        &download_counts,
+        repo_key,
+        &format!("{:?}", repo.format).to_lowercase(),
+    );
+
+    let total_components = components.len() as i64;
+    let total_pages = ((total_components as f64) / (per_page as f64)).ceil() as u32;
+    let offset = ((page - 1) * per_page) as usize;
+    let page_components: Vec<MavenComponentResponse> = components
+        .into_iter()
+        .skip(offset)
+        .take(per_page as usize)
+        .collect();
+
+    Ok(Json(ArtifactListResponse {
+        items: Vec::new(),
+        pagination: Pagination {
+            page,
+            per_page,
+            total: total_components,
+            total_pages,
+        },
+        components: Some(page_components),
+    }))
+}
+
+/// GAV key used to group Maven artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct GavKey {
+    group_id: String,
+    artifact_id: String,
+    version: String,
+}
+
+/// Group a flat list of Maven artifacts by GAV coordinates.
+///
+/// Returns a sorted `Vec` of `MavenComponentResponse` items. Artifacts whose
+/// paths cannot be parsed as Maven coordinates are skipped.
+fn group_maven_artifacts(
+    artifacts: &[crate::models::artifact::Artifact],
+    download_counts: &std::collections::HashMap<Uuid, i64>,
+    repo_key: &str,
+    format: &str,
+) -> Vec<MavenComponentResponse> {
+    let mut groups: BTreeMap<GavKey, MavenComponentResponse> = BTreeMap::new();
+
+    for artifact in artifacts {
+        let coords = match MavenHandler::parse_coordinates(&artifact.path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let key = GavKey {
+            group_id: coords.group_id.clone(),
+            artifact_id: coords.artifact_id.clone(),
+            version: coords.version.clone(),
+        };
+
+        let filename = artifact
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&artifact.name)
+            .to_string();
+
+        let downloads = *download_counts.get(&artifact.id).unwrap_or(&0);
+
+        groups
+            .entry(key)
+            .and_modify(|comp| {
+                comp.size_bytes += artifact.size_bytes;
+                comp.download_count += downloads;
+                if artifact.created_at < comp.created_at {
+                    comp.created_at = artifact.created_at;
+                }
+                comp.artifact_files.push(filename.clone());
+            })
+            .or_insert_with(|| MavenComponentResponse {
+                id: artifact.id,
+                group_id: coords.group_id,
+                artifact_id: coords.artifact_id,
+                version: coords.version,
+                repository_key: repo_key.to_string(),
+                format: format.to_string(),
+                size_bytes: artifact.size_bytes,
+                download_count: downloads,
+                created_at: artifact.created_at,
+                artifact_files: vec![filename],
+            });
+    }
+
+    groups.into_values().collect()
 }
 
 /// Get artifact metadata
@@ -992,6 +1288,7 @@ pub async fn get_artifact_metadata(
             id, repository_id, path, name, version, size_bytes,
             checksum_sha256, checksum_md5, checksum_sha1,
             content_type, storage_key, is_deleted, uploaded_by,
+            quarantine_status, quarantine_until,
             created_at, updated_at
         FROM artifacts
         WHERE repository_id = $1 AND path = $2 AND is_deleted = false
@@ -1254,6 +1551,34 @@ pub async fn download_artifact(
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth)?;
 
+    // Check quarantine status before serving the artifact.
+    // If the artifact is quarantined or rejected, return 409 Conflict.
+    {
+        #[derive(sqlx::FromRow)]
+        struct QuarantineRow {
+            quarantine_status: Option<String>,
+            quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+        }
+
+        if let Some(qrow) = sqlx::query_as::<_, QuarantineRow>(
+            "SELECT quarantine_status, quarantine_until \
+             FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo.id)
+        .bind(&path)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        {
+            crate::services::quarantine_service::check_download_allowed(
+                qrow.quarantine_status.as_deref(),
+                qrow.quarantine_until,
+                chrono::Utc::now(),
+            )?;
+        }
+    }
+
     // Get client IP for analytics
     let ip_addr = request
         .headers()
@@ -1270,9 +1595,12 @@ pub async fn download_artifact(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    // Check if the storage backend supports redirect downloads (S3 with presigned URLs)
+    // Check if the storage backend supports redirect downloads (S3 with presigned URLs).
+    // This path is gated on PRESIGNED_DOWNLOADS_ENABLED (or the per-backend
+    // redirect setting, which controls supports_redirect()).
     let storage = state.storage_for_repo(&repo.storage_location())?;
-    if storage.supports_redirect() {
+    let presigned_enabled = state.config.presigned_downloads_enabled && storage.supports_redirect();
+    if presigned_enabled {
         // Get artifact metadata first using query_as for runtime checking
         #[derive(sqlx::FromRow)]
         struct ArtifactRow {
@@ -1292,9 +1620,10 @@ pub async fn download_artifact(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         {
+            let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
             // Try to get presigned URL from the shared storage backend
             if let Some(presigned) = storage
-                .get_presigned_url(&artifact.storage_key, Duration::from_secs(3600))
+                .get_presigned_url(&artifact.storage_key, expiry)
                 .await?
             {
                 // Record download analytics
@@ -1361,8 +1690,13 @@ pub async fn download_artifact(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
+                // Apply routing rules to rewrite the path before upstream fetch
+                let rules = load_routing_rules(&state.db, repo.id).await;
+                let fetch_path = routing_rules::apply_routing_rules(&path, &rules)
+                    .unwrap_or_else(|| path.clone());
+
                 let (content, content_type) =
-                    proxy_helpers::proxy_fetch(proxy, repo.id, &key, upstream_url, &path)
+                    proxy_helpers::proxy_fetch(proxy, repo.id, &key, upstream_url, &fetch_path)
                         .await
                         .map_err(|_| {
                             AppError::NotFound("Artifact not found upstream".to_string())
@@ -1928,6 +2262,194 @@ pub async fn test_upstream(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Routing rules CRUD
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetRoutingRulesRequest {
+    /// Ordered list of routing rules. Each rule specifies a regex pattern and
+    /// a rewrite template. Rules are evaluated in order during proxy requests.
+    pub rules: Vec<RoutingRule>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RoutingRulesResponse {
+    pub repository_key: String,
+    pub rules: Vec<RoutingRule>,
+}
+
+/// Get routing rules for a repository
+#[utoipa::path(
+    get,
+    path = "/{key}/routing-rules",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    responses(
+        (status = 200, description = "Current routing rules", body = RoutingRulesResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_routing_rules(
+    State(state): State<SharedState>,
+    Path(key): Path<String>,
+) -> Result<Json<RoutingRulesResponse>> {
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+
+    let result: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT value FROM repository_config
+        WHERE repository_id = $1 AND key = 'routing_rules'
+        "#,
+    )
+    .bind(repo.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let rules: Vec<RoutingRule> = result
+        .and_then(|(v,)| serde_json::from_str(&v).ok())
+        .unwrap_or_default();
+
+    Ok(Json(RoutingRulesResponse {
+        repository_key: key,
+        rules,
+    }))
+}
+
+/// Set routing rules for a repository
+///
+/// Routing rules rewrite the request path before it is forwarded to the
+/// upstream server. This is useful for proxying resources like GitHub Releases
+/// where the client-facing path structure differs from the upstream URL
+/// layout. Rules are evaluated in order and the first match wins.
+#[utoipa::path(
+    post,
+    path = "/{key}/routing-rules",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = SetRoutingRulesRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Routing rules saved", body = RoutingRulesResponse),
+        (status = 400, description = "Invalid rule (bad regex or capture reference)"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_routing_rules(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<SetRoutingRulesRequest>,
+) -> Result<Json<RoutingRulesResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+
+    // Validate every rule before persisting
+    for (i, rule) in payload.rules.iter().enumerate() {
+        if let Err(msg) = routing_rules::validate_routing_rule(rule) {
+            return Err(AppError::Validation(format!(
+                "routing rule [{}]: {}",
+                i, msg
+            )));
+        }
+    }
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    let value = serde_json::to_string(&payload.rules)
+        .map_err(|e| AppError::Internal(format!("Failed to serialize routing rules: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO repository_config (repository_id, key, value)
+        VALUES ($1, 'routing_rules', $2)
+        ON CONFLICT (repository_id, key)
+        DO UPDATE SET value = $2, updated_at = NOW()
+        "#,
+    )
+    .bind(repo.id)
+    .bind(&value)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(RoutingRulesResponse {
+        repository_key: key,
+        rules: payload.rules,
+    }))
+}
+
+/// Delete all routing rules for a repository
+#[utoipa::path(
+    delete,
+    path = "/{key}/routing-rules",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Routing rules deleted"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn delete_routing_rules(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM repository_config
+        WHERE repository_id = $1 AND key = 'routing_rules'
+        "#,
+    )
+    .bind(repo.id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(
+        serde_json::json!({"message": "Routing rules deleted"}),
+    ))
+}
+
+/// Load routing rules from repository_config for a given repository ID.
+/// Returns an empty Vec if no rules are configured.
+async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule> {
+    let result: Option<(String,)> = sqlx::query_as(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'routing_rules'",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await
+    .unwrap_or(None);
+
+    result
+        .and_then(|(v,)| serde_json::from_str(&v).ok())
+        .unwrap_or_default()
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -1949,6 +2471,9 @@ pub async fn test_upstream(
         update_virtual_members,
         set_upstream_auth,
         test_upstream,
+        get_routing_rules,
+        set_routing_rules,
+        delete_routing_rules,
     ),
     components(schemas(
         ListRepositoriesQuery,
@@ -1961,6 +2486,7 @@ pub async fn test_upstream(
         ListArtifactsQuery,
         ArtifactResponse,
         ArtifactListResponse,
+        MavenComponentResponse,
         AddVirtualMemberRequest,
         UpdateVirtualMembersRequest,
         VirtualMemberPriority,
@@ -1968,6 +2494,9 @@ pub async fn test_upstream(
         VirtualMembersListResponse,
         CreateVirtualMemberInput,
         UpstreamAuthRequest,
+        SetRoutingRulesRequest,
+        RoutingRulesResponse,
+        RoutingRule,
     ))
 )]
 pub struct RepositoriesApiDoc;
@@ -2495,6 +3024,24 @@ mod tests {
         assert!(req.description.is_none());
         assert!(req.is_public.is_none());
         assert!(req.quota_bytes.is_none());
+        assert!(req.release_repository_key.is_none());
+    }
+
+    #[test]
+    fn test_update_repository_request_with_release_key() {
+        let json = r#"{"release_repository_key": "release-maven"}"#;
+        let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.release_repository_key,
+            Some("release-maven".to_string())
+        );
+    }
+
+    #[test]
+    fn test_update_repository_request_clear_release_key() {
+        let json = r#"{"release_repository_key": ""}"#;
+        let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.release_repository_key, Some(String::new()));
     }
 
     #[test]
@@ -2556,6 +3103,264 @@ mod tests {
         assert!(query.per_page.is_none());
         assert!(query.q.is_none());
         assert!(query.path_prefix.is_none());
+        assert!(query.group_by.is_none());
+    }
+
+    #[test]
+    fn test_list_artifacts_query_group_by() {
+        let json = r#"{"group_by": "maven_component"}"#;
+        let query: ListArtifactsQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.group_by.as_deref(), Some("maven_component"));
+    }
+
+    // -----------------------------------------------------------------------
+    // group_maven_artifacts
+    // -----------------------------------------------------------------------
+
+    /// Helper to build an Artifact fixture for grouping tests.
+    fn maven_artifact(path: &str, name: &str, size: i64) -> crate::models::artifact::Artifact {
+        crate::models::artifact::Artifact {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            path: path.to_string(),
+            name: name.to_string(),
+            version: None,
+            size_bytes: size,
+            checksum_sha256: "sha256".to_string(),
+            checksum_md5: None,
+            checksum_sha1: None,
+            content_type: "application/octet-stream".to_string(),
+            storage_key: path.to_string(),
+            is_deleted: false,
+            uploaded_by: None,
+            quarantine_status: None,
+            quarantine_until: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_group_maven_artifacts_single_component() {
+        let artifacts = vec![
+            maven_artifact(
+                "org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar",
+                "junit-jupiter-api-5.11.0.jar",
+                50_000,
+            ),
+            maven_artifact(
+                "org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.pom",
+                "junit-jupiter-api-5.11.0.pom",
+                2_000,
+            ),
+            maven_artifact(
+                "org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar.sha1",
+                "junit-jupiter-api-5.11.0.jar.sha1",
+                40,
+            ),
+        ];
+
+        let downloads = std::collections::HashMap::new();
+        let result = group_maven_artifacts(&artifacts, &downloads, "maven-central", "maven");
+
+        assert_eq!(result.len(), 1);
+        let comp = &result[0];
+        assert_eq!(comp.group_id, "org.junit.jupiter");
+        assert_eq!(comp.artifact_id, "junit-jupiter-api");
+        assert_eq!(comp.version, "5.11.0");
+        assert_eq!(comp.repository_key, "maven-central");
+        assert_eq!(comp.format, "maven");
+        assert_eq!(comp.size_bytes, 52_040);
+        assert_eq!(comp.artifact_files.len(), 3);
+        assert!(comp
+            .artifact_files
+            .contains(&"junit-jupiter-api-5.11.0.jar".to_string()));
+        assert!(comp
+            .artifact_files
+            .contains(&"junit-jupiter-api-5.11.0.pom".to_string()));
+        assert!(comp
+            .artifact_files
+            .contains(&"junit-jupiter-api-5.11.0.jar.sha1".to_string()));
+    }
+
+    #[test]
+    fn test_group_maven_artifacts_multiple_components() {
+        let artifacts = vec![
+            maven_artifact(
+                "org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar",
+                "junit-jupiter-api-5.11.0.jar",
+                50_000,
+            ),
+            maven_artifact(
+                "org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.pom",
+                "junit-jupiter-api-5.11.0.pom",
+                2_000,
+            ),
+            maven_artifact(
+                "com/google/guava/guava/33.0.0/guava-33.0.0.jar",
+                "guava-33.0.0.jar",
+                100_000,
+            ),
+            maven_artifact(
+                "com/google/guava/guava/33.0.0/guava-33.0.0.pom",
+                "guava-33.0.0.pom",
+                3_000,
+            ),
+        ];
+
+        let downloads = std::collections::HashMap::new();
+        let result = group_maven_artifacts(&artifacts, &downloads, "maven-central", "maven");
+
+        assert_eq!(result.len(), 2);
+        // BTreeMap ordering: "com.google.guava" < "org.junit.jupiter"
+        assert_eq!(result[0].group_id, "com.google.guava");
+        assert_eq!(result[0].artifact_id, "guava");
+        assert_eq!(result[0].version, "33.0.0");
+        assert_eq!(result[0].artifact_files.len(), 2);
+
+        assert_eq!(result[1].group_id, "org.junit.jupiter");
+        assert_eq!(result[1].artifact_id, "junit-jupiter-api");
+        assert_eq!(result[1].version, "5.11.0");
+        assert_eq!(result[1].artifact_files.len(), 2);
+    }
+
+    #[test]
+    fn test_group_maven_artifacts_different_versions() {
+        let artifacts = vec![
+            maven_artifact(
+                "org/example/lib/1.0.0/lib-1.0.0.jar",
+                "lib-1.0.0.jar",
+                10_000,
+            ),
+            maven_artifact(
+                "org/example/lib/2.0.0/lib-2.0.0.jar",
+                "lib-2.0.0.jar",
+                20_000,
+            ),
+        ];
+
+        let downloads = std::collections::HashMap::new();
+        let result = group_maven_artifacts(&artifacts, &downloads, "repo", "maven");
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].version, "1.0.0");
+        assert_eq!(result[1].version, "2.0.0");
+    }
+
+    #[test]
+    fn test_group_maven_artifacts_skips_unparseable_paths() {
+        let artifacts = vec![
+            maven_artifact("some-random-file.txt", "some-random-file.txt", 100),
+            maven_artifact(
+                "org/example/lib/1.0.0/lib-1.0.0.jar",
+                "lib-1.0.0.jar",
+                10_000,
+            ),
+        ];
+
+        let downloads = std::collections::HashMap::new();
+        let result = group_maven_artifacts(&artifacts, &downloads, "repo", "maven");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].artifact_id, "lib");
+    }
+
+    #[test]
+    fn test_group_maven_artifacts_download_counts_aggregated() {
+        let a1 = maven_artifact(
+            "org/example/lib/1.0.0/lib-1.0.0.jar",
+            "lib-1.0.0.jar",
+            10_000,
+        );
+        let a2 = maven_artifact("org/example/lib/1.0.0/lib-1.0.0.pom", "lib-1.0.0.pom", 500);
+
+        let mut downloads = std::collections::HashMap::new();
+        downloads.insert(a1.id, 100);
+        downloads.insert(a2.id, 25);
+
+        let result = group_maven_artifacts(&[a1, a2], &downloads, "repo", "maven");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].download_count, 125);
+        assert_eq!(result[0].size_bytes, 10_500);
+    }
+
+    #[test]
+    fn test_group_maven_artifacts_empty_input() {
+        let downloads = std::collections::HashMap::new();
+        let result = group_maven_artifacts(&[], &downloads, "repo", "maven");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_maven_component_response_serialization() {
+        let comp = MavenComponentResponse {
+            id: Uuid::new_v4(),
+            group_id: "org.junit.jupiter".to_string(),
+            artifact_id: "junit-jupiter-api".to_string(),
+            version: "5.11.0".to_string(),
+            repository_key: "maven-central".to_string(),
+            format: "maven".to_string(),
+            size_bytes: 52_040,
+            download_count: 42,
+            created_at: chrono::Utc::now(),
+            artifact_files: vec![
+                "junit-jupiter-api-5.11.0.jar".to_string(),
+                "junit-jupiter-api-5.11.0.pom".to_string(),
+            ],
+        };
+        let json = serde_json::to_string(&comp).unwrap();
+        assert!(json.contains("\"group_id\":\"org.junit.jupiter\""));
+        assert!(json.contains("\"artifact_id\":\"junit-jupiter-api\""));
+        assert!(json.contains("\"version\":\"5.11.0\""));
+        assert!(json.contains("\"artifact_files\":["));
+        assert!(json.contains("junit-jupiter-api-5.11.0.jar"));
+    }
+
+    #[test]
+    fn test_artifact_list_response_without_components() {
+        let resp = ArtifactListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page: 1,
+                per_page: 20,
+                total: 0,
+                total_pages: 0,
+            },
+            components: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        // components field should be omitted when None
+        assert!(!json.contains("\"components\""));
+    }
+
+    #[test]
+    fn test_artifact_list_response_with_components() {
+        let comp = MavenComponentResponse {
+            id: Uuid::new_v4(),
+            group_id: "org.example".to_string(),
+            artifact_id: "mylib".to_string(),
+            version: "1.0.0".to_string(),
+            repository_key: "repo".to_string(),
+            format: "maven".to_string(),
+            size_bytes: 1024,
+            download_count: 0,
+            created_at: chrono::Utc::now(),
+            artifact_files: vec!["mylib-1.0.0.jar".to_string()],
+        };
+        let resp = ArtifactListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page: 1,
+                per_page: 20,
+                total: 1,
+                total_pages: 1,
+            },
+            components: Some(vec![comp]),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"components\":["));
+        assert!(json.contains("\"group_id\":\"org.example\""));
     }
 
     #[test]

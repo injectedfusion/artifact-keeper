@@ -37,6 +37,7 @@ use artifact_keeper_backend::{
         scan_result_service::ScanResultService,
         scanner_service::{AdvisoryClient, ScannerService},
         scheduler_service,
+        smtp_service::SmtpService,
         storage_service::StorageService,
         wasm_plugin_service::WasmPluginService,
     },
@@ -111,7 +112,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     tracing::info!("Starting Artifact Keeper");
 
     // Connect to database
-    let db_pool = db::create_pool(&config.database_url).await?;
+    let db_pool = db::create_pool(&config).await?;
     tracing::info!("Connected to database");
 
     // Run migrations (skip with SKIP_MIGRATIONS=true for pre-applied migrations)
@@ -373,6 +374,32 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             );
         }
     }
+
+    // Initialize SMTP service (optional, graceful no-op when SMTP_HOST is absent)
+    match SmtpService::new(&config) {
+        Ok(smtp) => {
+            if smtp.is_configured() {
+                tracing::info!("SMTP service initialized");
+            } else {
+                tracing::info!("SMTP not configured, email delivery disabled");
+            }
+            app_state.set_smtp_service(Arc::new(smtp));
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to initialize SMTP service, email delivery disabled: {}",
+                e
+            );
+        }
+    }
+
+    // Start notification dispatcher (subscribes to EventBus for email/webhook delivery)
+    artifact_keeper_backend::services::notification_dispatcher::start_dispatcher(
+        app_state.event_bus.clone(),
+        app_state.db.clone(),
+        app_state.smtp_service.clone(),
+    );
+    tracing::info!("Notification dispatcher started");
 
     app_state
         .setup_required

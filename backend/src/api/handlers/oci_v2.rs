@@ -124,22 +124,7 @@ fn validate_token(
 }
 
 fn request_host(headers: &HeaderMap) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get("host"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-
-    if host.contains("://") {
-        host.to_string()
-    } else {
-        format!("{}://{}", scheme, host)
-    }
+    proxy_helpers::request_base_url(headers)
 }
 
 // ---------------------------------------------------------------------------
@@ -333,7 +318,8 @@ async fn token(
                        auth_provider as "auth_provider: crate::models::user::AuthProvider",
                        external_id, is_admin, is_active, is_service_account, must_change_password,
                        totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                       last_login_at, created_at, updated_at
+                       failed_login_attempts, locked_until, last_failed_login_at,
+                       password_changed_at, last_login_at, created_at, updated_at
                        FROM users WHERE id = $1"#,
                     claims.sub
                 )
