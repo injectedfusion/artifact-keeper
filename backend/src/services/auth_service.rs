@@ -14,6 +14,7 @@ use jsonwebtoken::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -177,6 +178,53 @@ impl AuthService {
         }
     }
 
+    /// Check whether a user account is currently locked.
+    ///
+    /// Returns `true` when the account has a `locked_until` timestamp in the
+    /// future. This is a pure function so it can be tested without a database.
+    pub fn is_account_locked(locked_until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+        locked_until.is_some_and(|t| t > now)
+    }
+
+    /// Check whether a user's password has expired.
+    ///
+    /// Returns `true` when `password_expiry_days` is non-zero and the
+    /// password was last changed more than that many days ago. This is a
+    /// pure function so it can be tested without a database.
+    pub fn is_password_expired(
+        password_changed_at: DateTime<Utc>,
+        password_expiry_days: u32,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if password_expiry_days == 0 {
+            return false;
+        }
+        let expiry = password_changed_at + Duration::days(password_expiry_days as i64);
+        now >= expiry
+    }
+
+    /// Decide whether a failed attempt should trigger a lockout.
+    ///
+    /// `attempts_after_failure` is the count *after* incrementing (i.e., the
+    /// value that will be written to the database). Returns the `locked_until`
+    /// timestamp when the threshold is met, or `None` if the account should
+    /// remain unlocked.
+    pub fn should_lock(
+        attempts_after_failure: i32,
+        threshold: u32,
+        duration_minutes: i64,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        if threshold == 0 {
+            return None; // lockout disabled
+        }
+        if attempts_after_failure >= threshold as i32 {
+            Some(now + Duration::minutes(duration_minutes))
+        } else {
+            None
+        }
+    }
+
     /// Authenticate user with username and password
     pub async fn authenticate(&self, username: &str, password: &str) -> Result<(User, TokenPair)> {
         // Fetch user from database
@@ -188,7 +236,8 @@ impl AuthService {
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                last_login_at, created_at, updated_at
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE username = $1 AND is_active = true
             "#,
@@ -198,6 +247,14 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::Authentication("Invalid username or password".to_string()))?;
+
+        // Check account lockout before verifying credentials
+        let now = Utc::now();
+        if Self::is_account_locked(user.locked_until, now) {
+            return Err(AppError::Authentication(
+                "Account temporarily locked due to too many failed login attempts".to_string(),
+            ));
+        }
 
         // Verify password for local auth
         if user.auth_provider != AuthProvider::Local {
@@ -212,19 +269,85 @@ impl AuthService {
             .ok_or_else(|| AppError::Authentication("Invalid username or password".to_string()))?;
 
         if !Self::verify_password(password, password_hash).await? {
+            // Record failed attempt
+            let new_count = user.failed_login_attempts + 1;
+            let lock_until = Self::should_lock(
+                new_count,
+                self.config.account_lockout_threshold,
+                self.config.account_lockout_duration_minutes,
+                now,
+            );
+
+            sqlx::query!(
+                r#"
+                UPDATE users
+                SET failed_login_attempts = $2,
+                    locked_until = $3,
+                    last_failed_login_at = $4
+                WHERE id = $1
+                "#,
+                user.id,
+                new_count,
+                lock_until,
+                now
+            )
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            if lock_until.is_some() {
+                return Err(AppError::Authentication(
+                    "Account temporarily locked due to too many failed login attempts".to_string(),
+                ));
+            }
+
             return Err(AppError::Authentication(
                 "Invalid username or password".to_string(),
             ));
         }
 
-        // Update last login
+        // Successful login: reset lockout counters and record last login
         sqlx::query!(
-            "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+            r#"
+            UPDATE users
+            SET last_login_at = NOW(),
+                failed_login_attempts = 0,
+                locked_until = NULL,
+                last_failed_login_at = NULL
+            WHERE id = $1
+            "#,
             user.id
         )
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Check password expiration for local users
+        let mut user = user;
+        if !user.must_change_password
+            && Self::is_password_expired(
+                user.password_changed_at,
+                self.config.password_expiry_days,
+                Utc::now(),
+            )
+        {
+            user.must_change_password = true;
+
+            // Persist the flag so it survives across requests
+            sqlx::query!(
+                r#"
+            UPDATE users
+            SET must_change_password = true
+            WHERE id = $1
+            "#,
+                user.id
+            )
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            info!(user_id = %user.id, "password expired, forcing change on next login");
+        }
 
         // Generate tokens
         let tokens = self.generate_tokens(&user)?;
@@ -309,7 +432,8 @@ impl AuthService {
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                last_login_at, created_at, updated_at
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE id = $1 AND is_active = true
             "#,
@@ -467,7 +591,8 @@ impl AuthService {
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                last_login_at, created_at, updated_at
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE id = $1 AND is_active = true
             "#,
@@ -693,7 +818,8 @@ impl AuthService {
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                last_login_at, created_at, updated_at
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE username = $1 AND auth_provider = 'ldap' AND is_active = true
             "#,
@@ -895,7 +1021,8 @@ impl AuthService {
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                last_login_at, created_at, updated_at
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE external_id = $1 AND auth_provider = $2
             "#,
@@ -925,7 +1052,8 @@ impl AuthService {
                     auth_provider as "auth_provider: AuthProvider",
                     external_id, is_admin, is_active, is_service_account, must_change_password,
                     totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                    last_login_at, created_at, updated_at
+                    failed_login_attempts, locked_until, last_failed_login_at,
+                    password_changed_at, last_login_at, created_at, updated_at
                 "#,
                 existing.id,
                 credentials.username,
@@ -951,7 +1079,8 @@ impl AuthService {
                     auth_provider as "auth_provider: AuthProvider",
                     external_id, is_admin, is_active, is_service_account, must_change_password,
                     totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                    last_login_at, created_at, updated_at
+                    failed_login_attempts, locked_until, last_failed_login_at,
+                    password_changed_at, last_login_at, created_at, updated_at
                 "#,
                 credentials.username,
                 credentials.email,
@@ -1045,7 +1174,8 @@ impl AuthService {
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                last_login_at, created_at, updated_at
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
             "#,
             external_id,
             provider as AuthProvider
@@ -1070,7 +1200,8 @@ impl AuthService {
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                last_login_at, created_at, updated_at
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE auth_provider = $1 AND is_active = true
             ORDER BY username
@@ -1254,6 +1385,37 @@ mod tests {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             metrics_port: None,
+            database_max_connections: 20,
+            database_min_connections: 5,
+            database_acquire_timeout_secs: 30,
+            database_idle_timeout_secs: 600,
+            database_max_lifetime_secs: 1800,
+            rate_limit_auth_per_window: 120,
+            rate_limit_api_per_window: 5000,
+            rate_limit_window_secs: 60,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
+            account_lockout_threshold: 5,
+            account_lockout_duration_minutes: 30,
+            quarantine_enabled: false,
+            quarantine_duration_minutes: 60,
+            password_history_count: 0,
+            password_expiry_days: 0,
+            password_min_length: 8,
+            password_max_length: 128,
+            password_require_uppercase: false,
+            password_require_lowercase: false,
+            password_require_digit: false,
+            password_require_special: false,
+            password_min_strength: 0,
+            presigned_downloads_enabled: false,
+            presigned_download_expiry_secs: 300,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from_address: "noreply@artifact-keeper.local".to_string(),
+            smtp_tls_mode: "starttls".to_string(),
         })
     }
 
@@ -1274,6 +1436,10 @@ mod tests {
             totp_enabled: false,
             totp_backup_codes: None,
             totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
+            password_changed_at: Utc::now(),
             last_login_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1839,6 +2005,10 @@ mod tests {
                 totp_enabled: false,
                 totp_backup_codes: None,
                 totp_verified_at: None,
+                failed_login_attempts: 0,
+                locked_until: None,
+                last_failed_login_at: None,
+                password_changed_at: Utc::now(),
                 last_login_at: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -1884,6 +2054,10 @@ mod tests {
                 totp_enabled: false,
                 totp_backup_codes: None,
                 totp_verified_at: None,
+                failed_login_attempts: 0,
+                locked_until: None,
+                last_failed_login_at: None,
+                password_changed_at: Utc::now(),
                 last_login_at: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -1948,6 +2122,10 @@ mod tests {
                     totp_enabled: false,
                     totp_backup_codes: None,
                     totp_verified_at: None,
+                    failed_login_attempts: 0,
+                    locked_until: None,
+                    last_failed_login_at: None,
+                    password_changed_at: Utc::now(),
                     last_login_at: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
@@ -1982,6 +2160,10 @@ mod tests {
                     totp_enabled: false,
                     totp_backup_codes: None,
                     totp_verified_at: None,
+                    failed_login_attempts: 0,
+                    locked_until: None,
+                    last_failed_login_at: None,
+                    password_changed_at: Utc::now(),
                     last_login_at: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
@@ -2094,5 +2276,126 @@ mod tests {
         let validation = Validation::new(Algorithm::HS256);
         let result = decode::<Claims>(&forged_token, &decoding_key, &validation);
         assert!(result.is_err(), "alg=none token must be rejected");
+    }
+
+    // -----------------------------------------------------------------------
+    // Account lockout (pure function tests, no DB)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_account_locked_returns_false_when_no_lock() {
+        let now = Utc::now();
+        assert!(!AuthService::is_account_locked(None, now));
+    }
+
+    #[test]
+    fn test_is_account_locked_returns_true_when_lock_in_future() {
+        let now = Utc::now();
+        let locked_until = now + Duration::minutes(15);
+        assert!(AuthService::is_account_locked(Some(locked_until), now));
+    }
+
+    #[test]
+    fn test_is_account_locked_returns_false_when_lock_expired() {
+        let now = Utc::now();
+        let locked_until = now - Duration::minutes(1);
+        assert!(!AuthService::is_account_locked(Some(locked_until), now));
+    }
+
+    #[test]
+    fn test_should_lock_returns_none_below_threshold() {
+        let now = Utc::now();
+        let result = AuthService::should_lock(3, 5, 30, now);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_should_lock_returns_timestamp_at_threshold() {
+        let now = Utc::now();
+        let result = AuthService::should_lock(5, 5, 30, now);
+        assert!(result.is_some());
+        let lock_time = result.unwrap();
+        // Lock should be 30 minutes in the future
+        let expected = now + Duration::minutes(30);
+        assert!((lock_time - expected).num_seconds().abs() < 2);
+    }
+
+    #[test]
+    fn test_should_lock_returns_timestamp_above_threshold() {
+        let now = Utc::now();
+        let result = AuthService::should_lock(8, 5, 30, now);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_should_lock_returns_none_when_threshold_is_zero() {
+        let now = Utc::now();
+        // threshold = 0 means lockout is disabled
+        let result = AuthService::should_lock(100, 0, 30, now);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_should_lock_custom_duration() {
+        let now = Utc::now();
+        let result = AuthService::should_lock(3, 3, 60, now);
+        assert!(result.is_some());
+        let lock_time = result.unwrap();
+        let expected = now + Duration::minutes(60);
+        assert!((lock_time - expected).num_seconds().abs() < 2);
+    }
+
+    #[test]
+    fn test_should_lock_single_attempt_threshold() {
+        let now = Utc::now();
+        // Lock after a single failed attempt
+        let result = AuthService::should_lock(1, 1, 10, now);
+        assert!(result.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_password_expired
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_password_expiry_disabled_when_zero() {
+        let now = Utc::now();
+        let changed_at = now - Duration::days(365);
+        assert!(!AuthService::is_password_expired(changed_at, 0, now));
+    }
+
+    #[test]
+    fn test_password_not_expired_within_window() {
+        let now = Utc::now();
+        let changed_at = now - Duration::days(10);
+        assert!(!AuthService::is_password_expired(changed_at, 90, now));
+    }
+
+    #[test]
+    fn test_password_expired_after_window() {
+        let now = Utc::now();
+        let changed_at = now - Duration::days(91);
+        assert!(AuthService::is_password_expired(changed_at, 90, now));
+    }
+
+    #[test]
+    fn test_password_expired_exactly_on_boundary() {
+        let now = Utc::now();
+        let changed_at = now - Duration::days(90);
+        // Password changed exactly 90 days ago with a 90-day policy: expired
+        assert!(AuthService::is_password_expired(changed_at, 90, now));
+    }
+
+    #[test]
+    fn test_password_just_changed_not_expired() {
+        let now = Utc::now();
+        assert!(!AuthService::is_password_expired(now, 1, now));
+    }
+
+    #[test]
+    fn test_password_expiry_one_day_policy() {
+        let now = Utc::now();
+        let changed_at = now - Duration::hours(25);
+        assert!(AuthService::is_password_expired(changed_at, 1, now));
     }
 }

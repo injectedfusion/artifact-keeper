@@ -2,8 +2,8 @@
 //!
 //! Provides per-IP and per-user rate limiting with configurable limits.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -12,9 +12,45 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use tokio::sync::RwLock;
 
 use super::auth::AuthExtension;
+
+/// Set of users and service account flags that bypass rate limiting.
+#[derive(Debug, Clone)]
+pub struct RateLimitExemptions {
+    pub usernames: HashSet<String>,
+    pub exempt_service_accounts: bool,
+}
+
+impl RateLimitExemptions {
+    pub fn new(usernames: Vec<String>, exempt_service_accounts: bool) -> Self {
+        Self {
+            usernames: usernames.into_iter().collect(),
+            exempt_service_accounts,
+        }
+    }
+
+    pub fn is_exempt(&self, auth: &AuthExtension) -> bool {
+        if self.usernames.contains(&auth.username) {
+            return true;
+        }
+        if self.exempt_service_accounts && auth.is_service_account {
+            return true;
+        }
+        false
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.usernames.is_empty() && !self.exempt_service_accounts
+    }
+}
+
+/// Combines a rate limiter with exemption rules, passed as shared state to the middleware.
+#[derive(Debug, Clone)]
+pub struct RateLimitState {
+    pub limiter: Arc<RateLimiter>,
+    pub exemptions: Arc<RateLimitExemptions>,
+}
 
 /// Per-instance, in-memory rate limiter that tracks requests per key (IP or user ID).
 ///
@@ -23,12 +59,18 @@ use super::auth::AuthExtension;
 /// with the number of instances. For multi-instance deployments behind a load
 /// balancer, use an ingress-level rate limiter (e.g. NGINX `limit_req`,
 /// Envoy, or a cloud WAF) to enforce global limits.
+///
+/// Uses `std::sync::Mutex` rather than `tokio::sync::RwLock` because the
+/// critical section is pure in-memory computation with no async work. A
+/// synchronous mutex avoids the overhead of yielding to the Tokio scheduler
+/// on every request and prevents task-queue contention that was observed
+/// under high-concurrency stress tests (issue #692).
 #[derive(Debug)]
 pub struct RateLimiter {
     /// Map of key -> (request count, window start time)
-    requests: Arc<RwLock<HashMap<String, (u32, Instant)>>>,
+    requests: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
     /// Maximum number of requests allowed per window
-    max_requests: u32,
+    pub(crate) max_requests: u32,
     /// Duration of the rate limiting window
     window: Duration,
 }
@@ -41,7 +83,7 @@ impl RateLimiter {
     /// * `window_secs` - Duration of the rate limiting window in seconds
     pub fn new(max_requests: u32, window_secs: u64) -> Self {
         Self {
-            requests: Arc::new(RwLock::new(HashMap::new())),
+            requests: Arc::new(Mutex::new(HashMap::new())),
             max_requests,
             window: Duration::from_secs(window_secs),
         }
@@ -53,7 +95,7 @@ impl RateLimiter {
     /// or `Err(retry_after_secs)` if the rate limit has been exceeded.
     pub async fn check_rate_limit(&self, key: &str) -> Result<u32, u64> {
         let now = Instant::now();
-        let mut requests = self.requests.write().await;
+        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
 
         let entry = requests.entry(key.to_string()).or_insert((0, now));
 
@@ -80,7 +122,7 @@ impl RateLimiter {
     /// Call this periodically to prevent memory bloat.
     pub async fn cleanup_expired(&self) {
         let now = Instant::now();
-        let mut requests = self.requests.write().await;
+        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
         requests.retain(|_, (_, window_start)| now.duration_since(*window_start) < self.window);
     }
 }
@@ -94,29 +136,49 @@ impl RateLimiter {
 /// Returns 429 Too Many Requests when the limit is exceeded,
 /// with a Retry-After header indicating when to retry.
 pub async fn rate_limit_middleware(
-    State(limiter): State<Arc<RateLimiter>>,
+    State(state): State<RateLimitState>,
     request: Request,
     next: Next,
 ) -> Response {
+    // Extract auth from extensions (required or optional middleware)
+    let auth = request
+        .extensions()
+        .get::<AuthExtension>()
+        .cloned()
+        .or_else(|| {
+            request
+                .extensions()
+                .get::<Option<AuthExtension>>()
+                .and_then(|opt| opt.clone())
+        });
+
+    // Check exemptions before rate limiting
+    if let Some(ref auth) = auth {
+        if state.exemptions.is_exempt(auth) {
+            let mut response = next.run(request).await;
+            if let Ok(value) = HeaderValue::from_str("true") {
+                response.headers_mut().insert("X-RateLimit-Exempt", value);
+            }
+            return response;
+        }
+    }
+
     // Determine the rate limit key
     // Priority: authenticated user ID > IP address
-    let key = if let Some(auth) = request.extensions().get::<AuthExtension>() {
-        format!("user:{}", auth.user_id)
-    } else if let Some(Some(auth)) = request.extensions().get::<Option<AuthExtension>>() {
-        // Handle optional auth middleware case
+    let key = if let Some(ref auth) = auth {
         format!("user:{}", auth.user_id)
     } else {
         extract_client_ip(&request)
     };
 
     // Check rate limit
-    match limiter.check_rate_limit(&key).await {
+    match state.limiter.check_rate_limit(&key).await {
         Ok(remaining) => {
             let mut response = next.run(request).await;
 
             // Add rate limit headers to successful responses
             let headers = response.headers_mut();
-            if let Ok(value) = HeaderValue::from_str(&limiter.max_requests.to_string()) {
+            if let Ok(value) = HeaderValue::from_str(&state.limiter.max_requests.to_string()) {
                 headers.insert("X-RateLimit-Limit", value);
             }
             if let Ok(value) = HeaderValue::from_str(&remaining.to_string()) {
@@ -126,6 +188,12 @@ pub async fn rate_limit_middleware(
             response
         }
         Err(retry_after) => {
+            tracing::debug!(
+                key = %key,
+                retry_after = retry_after,
+                "rate limit exceeded"
+            );
+
             let mut response = (
                 StatusCode::TOO_MANY_REQUESTS,
                 "Rate limit exceeded. Please try again later.",
@@ -137,7 +205,7 @@ pub async fn rate_limit_middleware(
             if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
                 headers.insert("Retry-After", value);
             }
-            if let Ok(value) = HeaderValue::from_str(&limiter.max_requests.to_string()) {
+            if let Ok(value) = HeaderValue::from_str(&state.limiter.max_requests.to_string()) {
                 headers.insert("X-RateLimit-Limit", value);
             }
             if let Ok(value) = HeaderValue::from_str("0") {
@@ -301,7 +369,7 @@ mod tests {
         // Cleanup should remove expired entries (key1, key2) but keep key3
         limiter.cleanup_expired().await;
 
-        let requests = limiter.requests.read().await;
+        let requests = limiter.requests.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             !requests.contains_key("key1"),
             "Expired key1 should be removed"
@@ -434,5 +502,52 @@ mod tests {
             .insert(axum::extract::ConnectInfo(addr));
         // ConnectInfo takes priority over spoofable headers
         assert_eq!(extract_client_ip(&request), "ip:10.0.0.5");
+    }
+
+    // -----------------------------------------------------------------------
+    // RateLimitExemptions
+    // -----------------------------------------------------------------------
+
+    fn make_auth(username: &str, is_service_account: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: uuid::Uuid::new_v4(),
+            username: username.to_string(),
+            email: format!("{}@test.com", username),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_exemptions_by_username() {
+        let ex = RateLimitExemptions::new(vec!["ci-bot".into()], false);
+        assert!(ex.is_exempt(&make_auth("ci-bot", false)));
+        assert!(!ex.is_exempt(&make_auth("alice", false)));
+    }
+
+    #[test]
+    fn test_exemptions_service_accounts() {
+        let ex = RateLimitExemptions::new(Vec::new(), true);
+        assert!(ex.is_exempt(&make_auth("deploy-sa", true)));
+        assert!(!ex.is_exempt(&make_auth("alice", false)));
+    }
+
+    #[test]
+    fn test_exemptions_empty() {
+        let ex = RateLimitExemptions::new(Vec::new(), false);
+        assert!(ex.is_empty());
+        assert!(!ex.is_exempt(&make_auth("alice", true)));
+    }
+
+    #[test]
+    fn test_exemptions_combined() {
+        let ex = RateLimitExemptions::new(vec!["ci-bot".into()], true);
+        assert!(!ex.is_empty());
+        assert!(ex.is_exempt(&make_auth("ci-bot", false)));
+        assert!(ex.is_exempt(&make_auth("deploy-sa", true)));
+        assert!(!ex.is_exempt(&make_auth("alice", false)));
     }
 }

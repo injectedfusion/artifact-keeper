@@ -147,30 +147,62 @@ Branch naming conventions:
 - `chore/` — maintenance, dependencies, CI
 - `docs/` — documentation only
 
+### Parallel Agent Work (shallow clones)
+
+When dispatching multiple agents to work on separate features or fixes in parallel, use **shallow clones in `/tmp/`** instead of git worktrees. Worktrees share the `.git` directory and agents end up switching branches in the main worktree, corrupting each other's state.
+
+**Pattern for each agent:**
+```bash
+WORK_DIR="/tmp/$(uuidgen)-artifact-keeper"
+git clone --depth 50 --branch main git@github.com:artifact-keeper/artifact-keeper.git "$WORK_DIR"
+cd "$WORK_DIR"
+git checkout -b feat/issue-description
+# ... make changes, run checks, commit, push, create PR ...
+rm -rf "$WORK_DIR"
+```
+
+Each agent gets a fully isolated repo copy. No shared state, no branch conflicts, no rust-analyzer cross-contamination. The agent must do ALL work inside `$WORK_DIR` and never touch the primary working directory at `/Users/khan/ak/artifact-keeper`.
+
+### Pre-push Quality Checklist
+
+Every commit must pass these checks locally before pushing. Do NOT use "push and see if CI passes" as a strategy.
+
+```bash
+cargo fmt --check                                          # formatting
+cargo clippy --workspace --all-targets -- -D warnings      # linting
+cargo test --workspace --lib                               # unit tests
+```
+
+Additionally, before pushing:
+- Check for code duplication: if structurally similar blocks appear 3+ times in new code, refactor into a shared helper
+- Check test coverage: new pure functions should have at least one test, aim for 70%+ of new lines covered
+- Check migration numbering: verify the migration number is not already taken (`ls backend/migrations/ | tail -5`)
+
 ### Maintenance Branches
 
 Long-lived `release/X.Y.x` branches exist for shipping bug fixes to older release series:
 
 - **`release/1.0.x`** — maintenance branch for the 1.0 series (created from `v1.0.0-rc.5`)
-- **`main`** — continues with 1.1.x (and beyond) development
+- **`release/1.1.x`** — maintenance branch for the 1.1 series (created from `v1.1.2`)
+- **`main`** — continues with 1.2.x (and beyond) development
 
 **Bug fix workflow for maintenance branches:**
 1. Create a fix branch from the maintenance branch:
    ```bash
-   git checkout release/1.0.x && git pull
+   git checkout release/1.1.x && git pull
    git checkout -b fix/short-description
    ```
-2. Push and create a PR **targeting `release/1.0.x`** (not main):
+2. Push and create a PR **targeting `release/1.1.x`** (not main):
    ```bash
    git push -u origin fix/short-description
-   gh pr create --base release/1.0.x --fill
+   gh pr create --base release/1.1.x --fill
    ```
 3. Tag releases from the maintenance branch:
    ```bash
-   git checkout release/1.0.x && git pull
-   git tag v1.0.1 && git push origin v1.0.1
+   git checkout release/1.1.x && git pull
+   git tag v1.1.3 && git push origin v1.1.3
    ```
-4. Cherry-pick to the maintenance branch when a fix on `main` also applies to 1.0.x.
+4. Cherry-pick fixes between maintenance and `main` so both lines stay in sync. Bug fixes typically land on the maintenance branch first, then cherry-pick forward to main.
 
 **Docker image tags** (set by `docker/metadata-action` in `docker-publish.yml`):
 - Version tags **strip the `v` prefix**: git tag `v1.1.0-rc.2` → Docker tag `:1.1.0-rc.2`

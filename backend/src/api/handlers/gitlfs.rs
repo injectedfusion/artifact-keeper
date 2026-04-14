@@ -421,17 +421,11 @@ async fn batch(
 }
 
 fn build_base_url(headers: &HeaderMap, repo_key: &str) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-
-    format!("{}://{}/lfs/{}", scheme, host, repo_key)
+    format!(
+        "{}/lfs/{}",
+        proxy_helpers::request_base_url(headers),
+        repo_key
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -662,6 +656,11 @@ async fn download_object(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         lfs_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

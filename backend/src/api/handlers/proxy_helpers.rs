@@ -1,6 +1,6 @@
 //! Shared helpers for remote repository proxying and virtual repository resolution.
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::api::download_response::try_presigned_redirect;
 use crate::api::AppState;
 use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
@@ -17,6 +19,39 @@ use crate::models::repository::{
 use crate::services::proxy_service::ProxyService;
 use crate::services::scanner_service::ScannerService;
 use crate::storage::{StorageLocation, StorageRegistry};
+
+// ---------------------------------------------------------------------------
+// Base URL from request headers
+// ---------------------------------------------------------------------------
+
+/// Derive the external base URL from reverse-proxy headers.
+///
+/// Checks `X-Forwarded-Proto` for the scheme (defaults to `"http"`) and
+/// `X-Forwarded-Host` then `Host` for the hostname (defaults to
+/// `"localhost"`). If the host value already contains a scheme prefix it is
+/// returned as-is to avoid duplication.
+///
+/// Most format handlers need to construct absolute URLs for clients (OCI,
+/// NuGet, npm, Cargo, Git LFS, SSO/OIDC). This function centralizes the
+/// header inspection logic so each handler does not duplicate it.
+pub fn request_base_url(headers: &HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+
+    if host.contains("://") {
+        host.to_string()
+    } else {
+        format!("{}://{}", scheme, host)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared RepoInfo
@@ -170,6 +205,68 @@ pub async fn proxy_fetch(
         .fetch_artifact(&repo, path)
         .await
         .map_err(|e| map_proxy_error(repo_key, path, e))
+}
+
+/// Fetch from upstream via the proxy service, returning a presigned redirect
+/// if the storage backend supports it and presigned downloads are enabled.
+///
+/// When the proxy cache serves a hit and the storage backend supports presigned
+/// URLs, this returns a 302 redirect to the presigned URL instead of streaming
+/// the full content through the backend. Otherwise it falls back to returning
+/// the content bytes.
+///
+/// Format handlers can use this as a drop-in replacement for [`proxy_fetch`]
+/// when they want to take advantage of presigned redirects for cached proxy
+/// content.
+pub async fn proxy_fetch_or_redirect(
+    proxy_service: &ProxyService,
+    state: &AppState,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<Response, Response> {
+    let (content, content_type) =
+        proxy_fetch(proxy_service, repo_id, repo_key, upstream_url, path).await?;
+
+    // If presigned downloads are enabled, try to redirect to the cached copy.
+    // The proxy cache stores content under a well-known key derived from
+    // the repo key and path.
+    if state.config.presigned_downloads_enabled {
+        let cache_key = proxy_cache_storage_key(repo_key, path);
+        let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
+
+        if let Ok(storage) = state.storage_for_repo(&StorageLocation {
+            backend: state.config.storage_backend.clone(),
+            path: state.config.storage_path.clone(),
+        }) {
+            if let Some(redirect) =
+                try_presigned_redirect(storage.as_ref(), &cache_key, true, expiry).await
+            {
+                return Ok(redirect);
+            }
+        }
+    }
+
+    let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", ct)
+        .header("content-length", content.len().to_string())
+        .body(axum::body::Body::from(content))
+        .unwrap())
+}
+
+/// Derive the proxy cache storage key for a given repo key and artifact path.
+///
+/// Matches the key pattern used by `ProxyService::cache_storage_key`, so
+/// presigned redirects point to the correct cached object.
+fn proxy_cache_storage_key(repo_key: &str, path: &str) -> String {
+    format!(
+        "proxy-cache/{}/{}/__content__",
+        repo_key,
+        path.trim_start_matches('/').trim_end_matches('/')
+    )
 }
 
 /// Check whether an artifact is present in the proxy cache under `path`
@@ -451,6 +548,26 @@ pub async fn fetch_virtual_members(
     })
 }
 
+/// Row type for local artifact fetch queries, including quarantine fields.
+#[derive(sqlx::FromRow)]
+struct LocalArtifactRow {
+    storage_key: String,
+    content_type: String,
+    quarantine_status: Option<String>,
+    quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Check quarantine status on a fetched artifact row, mapping errors to Response.
+#[allow(clippy::result_large_err)]
+fn check_quarantine(row: &LocalArtifactRow) -> Result<(), Response> {
+    crate::services::quarantine_service::check_download_allowed(
+        row.quarantine_status.as_deref(),
+        row.quarantine_until,
+        chrono::Utc::now(),
+    )
+    .map_err(|e| e.into_response())
+}
+
 /// Generic local artifact fetch by exact path match.
 /// Used as a `local_fetch` callback for [`resolve_virtual_download`].
 pub async fn local_fetch_by_path(
@@ -460,18 +577,20 @@ pub async fn local_fetch_by_path(
     location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query!(
-        r#"SELECT storage_key, content_type
-        FROM artifacts
-        WHERE repository_id = $1 AND path = $2 AND is_deleted = false
-        LIMIT 1"#,
-        repo_id,
-        artifact_path
+    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
+        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+         FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
+         LIMIT 1",
     )
+    .bind(repo_id)
+    .bind(artifact_path)
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    check_quarantine(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
     let content = storage
@@ -492,19 +611,21 @@ pub async fn local_fetch_by_name_version(
     name: &str,
     version: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query!(
-        r#"SELECT storage_key, content_type
-        FROM artifacts
-        WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false
-        LIMIT 1"#,
-        repo_id,
-        name,
-        version
+    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
+        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+         FROM artifacts \
+         WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
+         LIMIT 1",
     )
+    .bind(repo_id)
+    .bind(name)
+    .bind(version)
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    check_quarantine(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
     let content = storage
@@ -524,18 +645,20 @@ pub async fn local_fetch_by_path_suffix(
     location: &StorageLocation,
     path_suffix: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query!(
-        r#"SELECT storage_key, content_type
-        FROM artifacts
-        WHERE repository_id = $1 AND path LIKE '%/' || $2 AND is_deleted = false
-        LIMIT 1"#,
-        repo_id,
-        path_suffix
+    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
+        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+         FROM artifacts \
+         WHERE repository_id = $1 AND path LIKE '%/' || $2 AND is_deleted = false \
+         LIMIT 1",
     )
+    .bind(repo_id)
+    .bind(path_suffix)
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    check_quarantine(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
     let content = storage
@@ -544,6 +667,59 @@ pub async fn local_fetch_by_path_suffix(
         .map_err(|e| internal_error("Storage", e))?;
 
     Ok((content, Some(artifact.content_type)))
+}
+
+/// Look up a local artifact by path and return a presigned redirect if the
+/// storage backend supports it and the feature is enabled. Falls back to
+/// streaming the content bytes when redirect is not possible.
+///
+/// This is meant for format handlers that serve stored artifacts and want to
+/// opt in to presigned download redirects without restructuring their logic.
+pub async fn local_fetch_or_redirect(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    artifact_path: &str,
+) -> Result<Response, Response> {
+    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
+        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+         FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
+         LIMIT 1",
+    )
+    .bind(repo_id)
+    .bind(artifact_path)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    check_quarantine(&artifact)?;
+
+    let storage = state.storage_for_repo_or_500(location)?;
+
+    // Try presigned redirect before reading content into memory
+    if state.config.presigned_downloads_enabled {
+        let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
+        if let Some(redirect) =
+            try_presigned_redirect(storage.as_ref(), &artifact.storage_key, true, expiry).await
+        {
+            return Ok(redirect);
+        }
+    }
+
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", &artifact.content_type)
+        .header("content-length", content.len().to_string())
+        .body(axum::body::Body::from(content))
+        .unwrap())
 }
 
 /// Build a minimal `Repository` model for proxy operations.
@@ -749,7 +925,76 @@ pub fn register_proxied_artifact(artifact: ProxiedArtifact) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
+    use axum::http::{HeaderValue, StatusCode};
+
+    // ── request_base_url tests ──────────────────────────────────────
+
+    #[test]
+    fn test_request_base_url_no_headers() {
+        let headers = HeaderMap::new();
+        assert_eq!(request_base_url(&headers), "http://localhost");
+    }
+
+    #[test]
+    fn test_request_base_url_host_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("registry.example.com"));
+        assert_eq!(request_base_url(&headers), "http://registry.example.com");
+    }
+
+    #[test]
+    fn test_request_base_url_host_with_port() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("localhost:8080"));
+        assert_eq!(request_base_url(&headers), "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_request_base_url_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("registry.example.com"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(request_base_url(&headers), "https://registry.example.com");
+    }
+
+    #[test]
+    fn test_request_base_url_forwarded_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("backend:8080"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("registry.example.com:30443"),
+        );
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(
+            request_base_url(&headers),
+            "https://registry.example.com:30443"
+        );
+    }
+
+    #[test]
+    fn test_request_base_url_forwarded_host_without_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("backend:8080"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("registry.example.com"),
+        );
+        assert_eq!(request_base_url(&headers), "http://registry.example.com");
+    }
+
+    #[test]
+    fn test_request_base_url_host_with_embedded_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "host",
+            HeaderValue::from_static("https://already-absolute.example.com"),
+        );
+        assert_eq!(
+            request_base_url(&headers),
+            "https://already-absolute.example.com"
+        );
+    }
 
     // ── build_remote_repo tests ──────────────────────────────────────
 
@@ -1025,5 +1270,47 @@ mod tests {
             hash,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+    }
+
+    // ── proxy_cache_storage_key tests ──────────────────────────────────
+
+    #[test]
+    fn test_proxy_cache_storage_key_basic() {
+        let key = super::proxy_cache_storage_key("npm-remote", "lodash/-/lodash-4.17.21.tgz");
+        assert_eq!(
+            key,
+            "proxy-cache/npm-remote/lodash/-/lodash-4.17.21.tgz/__content__"
+        );
+    }
+
+    #[test]
+    fn test_proxy_cache_storage_key_strips_leading_slash() {
+        let key = super::proxy_cache_storage_key("maven-central", "/com/example/lib-1.0.jar");
+        assert_eq!(
+            key,
+            "proxy-cache/maven-central/com/example/lib-1.0.jar/__content__"
+        );
+    }
+
+    #[test]
+    fn test_proxy_cache_storage_key_strips_trailing_slash() {
+        let key = super::proxy_cache_storage_key("pypi-proxy", "packages/simple/requests/");
+        assert_eq!(
+            key,
+            "proxy-cache/pypi-proxy/packages/simple/requests/__content__"
+        );
+    }
+
+    #[test]
+    fn test_proxy_cache_storage_key_no_slashes() {
+        let key = super::proxy_cache_storage_key("npm-remote", "express");
+        assert_eq!(key, "proxy-cache/npm-remote/express/__content__");
+    }
+
+    #[test]
+    fn test_proxy_cache_storage_key_matches_proxy_service_format() {
+        let key = super::proxy_cache_storage_key("test-repo", "path/to/artifact");
+        assert!(key.starts_with("proxy-cache/"));
+        assert!(key.ends_with("/__content__"));
     }
 }
