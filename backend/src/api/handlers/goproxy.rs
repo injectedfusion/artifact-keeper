@@ -20,8 +20,11 @@ use axum::routing::get;
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use reqwest::Client;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::sync::OnceLock;
+use std::time::Duration;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
@@ -90,6 +93,13 @@ enum GoProxyRequest {
     Zip { module: String, version: String },
     /// `/@latest` — latest version info
     Latest { module: String },
+    /// `sumdb/...` — checksum database verification proxy
+    SumDb {
+        /// The sumdb host, e.g. `sum.golang.org`
+        host: String,
+        /// The remaining path after the host, e.g. `lookup/...` or `tile/...`
+        path: String,
+    },
 }
 
 /// Parse the wildcard path segment into a GoProxyRequest.
@@ -98,10 +108,36 @@ enum GoProxyRequest {
 ///   `github.com/!azure/go-sdk/@v/list`
 ///   `github.com/!azure/go-sdk/@v/v1.0.0.info`
 ///   `github.com/!azure/go-sdk/@latest`
+///   `sumdb/sum.golang.org/lookup/golang.org/x/text@v0.14.0`
 #[allow(clippy::result_large_err)]
 fn parse_path(raw_path: &str) -> Result<GoProxyRequest, Response> {
     // Strip leading slash if present (axum wildcard may include it)
     let path = raw_path.strip_prefix('/').unwrap_or(raw_path);
+
+    // Check for sumdb/ prefix — go.sum verification requests.
+    // When GOPROXY is set, the Go toolchain sends checksum database queries
+    // through the proxy at paths like sumdb/sum.golang.org/lookup/...
+    if let Some(rest) = path.strip_prefix("sumdb/") {
+        // Expected format: sumdb/{host}/{remaining_path}
+        // e.g. sumdb/sum.golang.org/lookup/golang.org/x/text@v0.14.0
+        // e.g. sumdb/sum.golang.org/tile/8/0/000
+        // e.g. sumdb/sum.golang.org/supported
+        if let Some(slash_pos) = rest.find('/') {
+            let host = rest[..slash_pos].to_string();
+            let remaining = rest[slash_pos + 1..].to_string();
+            if !host.is_empty() && !remaining.is_empty() {
+                return Ok(GoProxyRequest::SumDb {
+                    host,
+                    path: remaining,
+                });
+            }
+        }
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid sumdb path: expected sumdb/{host}/{path}",
+        )
+            .into_response());
+    }
 
     // Check for /@latest suffix
     if let Some(module_encoded) = path.strip_suffix("/@latest") {
@@ -187,7 +223,86 @@ async fn handle_get(
             download_zip(&state, &repo, &module, &version).await
         }
         GoProxyRequest::Latest { module } => latest_version(&state, &repo, &module).await,
+        GoProxyRequest::SumDb { host, path } => proxy_sumdb(&host, &path).await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET sumdb/... — Proxy to upstream checksum database
+// ---------------------------------------------------------------------------
+
+/// Allowed sumdb upstream hosts. Prevents SSRF via the `{host}` path segment.
+const ALLOWED_SUMDB_HOSTS: &[&str] = &["sum.golang.org"];
+
+/// Shared `reqwest::Client` for sumdb proxy calls. Built once to reuse
+/// the connection pool instead of reconstructing per request.
+fn sumdb_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build sumdb reqwest client")
+    })
+}
+
+/// Returns true when `host` is on the sumdb proxy allowlist.
+fn is_sumdb_host_allowed(host: &str) -> bool {
+    ALLOWED_SUMDB_HOSTS.contains(&host)
+}
+
+/// Proxy a sumdb request to the upstream checksum database.
+///
+/// The Go toolchain performs go.sum verification by querying
+/// `$GOPROXY/sumdb/sum.golang.org/{path}`. We forward these requests
+/// to `https://{host}/{path}` only when `{host}` is in `ALLOWED_SUMDB_HOSTS`
+/// to prevent SSRF against internal services or cloud metadata endpoints.
+async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
+    if !is_sumdb_host_allowed(host) {
+        tracing::warn!("Rejected sumdb request to unauthorized host: {}", host);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("sumdb host not allowed: {}", host),
+        )
+            .into_response());
+    }
+
+    let url = format!("https://{}/{}", host, path);
+
+    tracing::debug!("Proxying sumdb request to {}", url);
+
+    let upstream_resp = sumdb_client().get(&url).send().await.map_err(|e| {
+        tracing::warn!("sumdb proxy request failed for {}: {}", url, e);
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to reach checksum database: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let status = upstream_resp.status();
+    let content_type = upstream_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let body = upstream_resp.bytes().await.map_err(|e| {
+        tracing::warn!("sumdb proxy response read failed for {}: {}", url, e);
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to read checksum database response: {}", e),
+        )
+            .into_response()
+    })?;
+
+    // Forward the upstream status code (200, 404, etc.)
+    Ok(Response::builder()
+        .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +637,11 @@ async fn get_mod_file(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -675,6 +795,11 @@ async fn download_zip(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1230,6 +1355,118 @@ mod tests {
     #[test]
     fn test_parse_path_invalid() {
         assert!(parse_path("github.com/user/repo/invalid").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // sumdb path parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_sumdb_lookup() {
+        let req = parse_path("sumdb/sum.golang.org/lookup/golang.org/x/text@v0.14.0").unwrap();
+        match req {
+            GoProxyRequest::SumDb { host, path } => {
+                assert_eq!(host, "sum.golang.org");
+                assert_eq!(path, "lookup/golang.org/x/text@v0.14.0");
+            }
+            _ => panic!("Expected SumDb"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sumdb_tile() {
+        let req = parse_path("sumdb/sum.golang.org/tile/8/0/000").unwrap();
+        match req {
+            GoProxyRequest::SumDb { host, path } => {
+                assert_eq!(host, "sum.golang.org");
+                assert_eq!(path, "tile/8/0/000");
+            }
+            _ => panic!("Expected SumDb"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sumdb_supported() {
+        let req = parse_path("sumdb/sum.golang.org/supported").unwrap();
+        match req {
+            GoProxyRequest::SumDb { host, path } => {
+                assert_eq!(host, "sum.golang.org");
+                assert_eq!(path, "supported");
+            }
+            _ => panic!("Expected SumDb"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sumdb_latest() {
+        let req = parse_path("sumdb/sum.golang.org/latest").unwrap();
+        match req {
+            GoProxyRequest::SumDb { host, path } => {
+                assert_eq!(host, "sum.golang.org");
+                assert_eq!(path, "latest");
+            }
+            _ => panic!("Expected SumDb"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sumdb_with_leading_slash() {
+        let req = parse_path("/sumdb/sum.golang.org/lookup/example.com/pkg@v1.0.0").unwrap();
+        match req {
+            GoProxyRequest::SumDb { host, path } => {
+                assert_eq!(host, "sum.golang.org");
+                assert_eq!(path, "lookup/example.com/pkg@v1.0.0");
+            }
+            _ => panic!("Expected SumDb"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sumdb_custom_host() {
+        let req = parse_path("sumdb/custom.sumdb.example.com/lookup/mod@v1.0.0").unwrap();
+        match req {
+            GoProxyRequest::SumDb { host, path } => {
+                assert_eq!(host, "custom.sumdb.example.com");
+                assert_eq!(path, "lookup/mod@v1.0.0");
+            }
+            _ => panic!("Expected SumDb"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sumdb_no_path_returns_error() {
+        assert!(parse_path("sumdb/sum.golang.org").is_err());
+    }
+
+    #[test]
+    fn test_parse_sumdb_empty_host_returns_error() {
+        assert!(parse_path("sumdb//lookup").is_err());
+    }
+
+    #[test]
+    fn test_parse_sumdb_only_prefix_returns_error() {
+        assert!(parse_path("sumdb/").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // SSRF allowlist — is_sumdb_host_allowed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sumdb_host_allowlist_accepts_sum_golang_org() {
+        assert!(super::is_sumdb_host_allowed("sum.golang.org"));
+    }
+
+    #[test]
+    fn test_sumdb_host_allowlist_rejects_attacker_hosts() {
+        // Cloud metadata, loopback, and arbitrary internal hosts must be
+        // rejected. The `host` segment comes straight from the URL path.
+        assert!(!super::is_sumdb_host_allowed("169.254.169.254"));
+        assert!(!super::is_sumdb_host_allowed("localhost"));
+        assert!(!super::is_sumdb_host_allowed("127.0.0.1"));
+        assert!(!super::is_sumdb_host_allowed("metadata.google.internal"));
+        assert!(!super::is_sumdb_host_allowed("internal.service"));
+        assert!(!super::is_sumdb_host_allowed(""));
     }
 
     // -----------------------------------------------------------------------

@@ -134,6 +134,117 @@ pub struct Config {
     /// **Security note:** ensure this port is not reachable from untrusted
     /// networks (e.g. restrict via firewall or Kubernetes NetworkPolicy).
     pub metrics_port: Option<u16>,
+
+    /// Maximum number of connections in the PostgreSQL pool.
+    /// Defaults to 20. Increase for higher concurrency, decrease for
+    /// databases with restricted connection budgets (e.g., shared RDS).
+    pub database_max_connections: u32,
+
+    /// Minimum number of idle connections kept in the PostgreSQL pool.
+    /// Defaults to 5. Set to 0 to allow the pool to scale down completely.
+    pub database_min_connections: u32,
+
+    /// Timeout in seconds for acquiring a connection from the pool before
+    /// returning an error. Defaults to 30.
+    pub database_acquire_timeout_secs: u64,
+
+    /// Idle timeout in seconds. Connections idle longer than this will be
+    /// closed. Defaults to 600 (10 minutes).
+    pub database_idle_timeout_secs: u64,
+
+    /// Maximum lifetime in seconds for a pooled connection. Connections
+    /// older than this are recycled even if still healthy. Defaults to
+    /// 1800 (30 minutes). Useful when the database has a connection
+    /// lifetime policy or when running behind a TCP load balancer with an
+    /// idle disconnect.
+    pub database_max_lifetime_secs: u64,
+
+    pub rate_limit_auth_per_window: u32,
+    pub rate_limit_api_per_window: u32,
+    pub rate_limit_window_secs: u64,
+    pub rate_limit_exempt_usernames: Vec<String>,
+    pub rate_limit_exempt_service_accounts: bool,
+
+    /// Number of consecutive failed login attempts before a local account is
+    /// locked. Set to 0 to disable account lockout. Default: 5.
+    pub account_lockout_threshold: u32,
+
+    /// Duration in minutes that a locked account remains locked before the
+    /// user can try again. Default: 30.
+    pub account_lockout_duration_minutes: i64,
+
+    /// When true, newly uploaded artifacts are held in quarantine until
+    /// security scanning completes or the hold period expires. Repositories
+    /// can override this via repository_config keys. Default: false.
+    pub quarantine_enabled: bool,
+
+    /// Default quarantine hold period in minutes. Repositories can override
+    /// this via repository_config keys. Default: 60.
+    pub quarantine_duration_minutes: i64,
+
+    /// Number of previous passwords to remember per user. When a user changes
+    /// their password, the new password is checked against the last N hashes
+    /// and rejected if it matches any of them. Set to 0 to disable password
+    /// history checking. Default: 0 (disabled).
+    pub password_history_count: u32,
+
+    /// Number of days after which a local user's password expires and must
+    /// be changed. Set to 0 to disable password expiration. Default: 0.
+    pub password_expiry_days: u32,
+
+    // -- Password policy (local users) --
+    /// Minimum password length (default: 8).
+    pub password_min_length: usize,
+
+    /// Maximum password length (default: 128).
+    pub password_max_length: usize,
+
+    /// Require at least one uppercase letter (default: false).
+    pub password_require_uppercase: bool,
+
+    /// Require at least one lowercase letter (default: false).
+    pub password_require_lowercase: bool,
+
+    /// Require at least one digit (default: false).
+    pub password_require_digit: bool,
+
+    /// Require at least one special character (default: false).
+    pub password_require_special: bool,
+
+    /// Minimum zxcvbn strength score (0 = disabled, 1-4 = increasingly strict).
+    /// When set to a value > 0, passwords are evaluated by the zxcvbn estimator
+    /// and must meet or exceed the given score.
+    pub password_min_strength: u8,
+
+    /// When true, artifact downloads served from storage backends that support
+    /// presigned URLs (S3, GCS, Azure) will return a 302 redirect to a
+    /// presigned URL instead of proxying the bytes through the backend. This
+    /// reduces bandwidth and CPU usage on the backend server. Default: false.
+    pub presigned_downloads_enabled: bool,
+
+    /// Expiry in seconds for presigned download URLs. Only used when
+    /// `presigned_downloads_enabled` is true. Default: 300 (5 minutes).
+    pub presigned_download_expiry_secs: u64,
+
+    // -- SMTP (optional, notifications are disabled when smtp_host is None) --
+    /// SMTP server hostname. When absent, email delivery is disabled and the
+    /// SMTP service operates as a no-op.
+    pub smtp_host: Option<String>,
+
+    /// SMTP server port (default: 587).
+    pub smtp_port: u16,
+
+    /// SMTP username for authentication (optional).
+    pub smtp_username: Option<String>,
+
+    /// SMTP password for authentication (optional).
+    pub smtp_password: Option<String>,
+
+    /// Sender address used in the From header (default: "noreply@artifact-keeper.local").
+    pub smtp_from_address: String,
+
+    /// TLS mode for the SMTP connection: "starttls" (default), "tls", or "none".
+    pub smtp_tls_mode: String,
 }
 
 redacted_debug!(Config {
@@ -173,6 +284,37 @@ redacted_debug!(Config {
     show max_upload_size_bytes,
     show allow_local_admin_login,
     show metrics_port,
+    show database_max_connections,
+    show database_min_connections,
+    show database_acquire_timeout_secs,
+    show database_idle_timeout_secs,
+    show database_max_lifetime_secs,
+    show rate_limit_auth_per_window,
+    show rate_limit_api_per_window,
+    show rate_limit_window_secs,
+    show rate_limit_exempt_usernames,
+    show rate_limit_exempt_service_accounts,
+    show account_lockout_threshold,
+    show account_lockout_duration_minutes,
+    show quarantine_enabled,
+    show quarantine_duration_minutes,
+    show password_history_count,
+    show password_expiry_days,
+    show password_min_length,
+    show password_max_length,
+    show password_require_uppercase,
+    show password_require_lowercase,
+    show password_require_digit,
+    show password_require_special,
+    show password_min_strength,
+    show presigned_downloads_enabled,
+    show presigned_download_expiry_secs,
+    show smtp_host,
+    show smtp_port,
+    show smtp_username,
+    redact_option smtp_password,
+    show smtp_from_address,
+    show smtp_tls_mode,
 });
 
 impl Config {
@@ -255,6 +397,87 @@ impl Config {
                     }
                 },
                 Err(_) => None,
+            },
+            database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 20),
+            database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
+            database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 30),
+            database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
+            database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
+            rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
+            rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
+            rate_limit_window_secs: env_parse("RATE_LIMIT_WINDOW_SECS", 60),
+            rate_limit_exempt_usernames: env::var("RATE_LIMIT_EXEMPT_USERNAMES")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|u| u.trim().to_string())
+                        .filter(|u| !u.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            rate_limit_exempt_service_accounts: matches!(
+                env::var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS").as_deref(),
+                Ok("true" | "1")
+            ),
+            account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
+            account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
+            quarantine_enabled: {
+                let (enabled, _) = crate::services::quarantine_service::global_defaults_from_env();
+                enabled
+            },
+            quarantine_duration_minutes: {
+                let (_, duration) = crate::services::quarantine_service::global_defaults_from_env();
+                duration.max(1)
+            },
+            password_history_count: env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24),
+            password_expiry_days: env_parse("PASSWORD_EXPIRY_DAYS", 0).min(3650),
+            password_min_length: env_parse("PASSWORD_MIN_LENGTH", 8),
+            password_max_length: env_parse("PASSWORD_MAX_LENGTH", 128),
+            password_require_uppercase: matches!(
+                env::var("PASSWORD_REQUIRE_UPPERCASE").as_deref(),
+                Ok("true" | "1")
+            ),
+            password_require_lowercase: matches!(
+                env::var("PASSWORD_REQUIRE_LOWERCASE").as_deref(),
+                Ok("true" | "1")
+            ),
+            password_require_digit: matches!(
+                env::var("PASSWORD_REQUIRE_DIGIT").as_deref(),
+                Ok("true" | "1")
+            ),
+            password_require_special: matches!(
+                env::var("PASSWORD_REQUIRE_SPECIAL").as_deref(),
+                Ok("true" | "1")
+            ),
+            password_min_strength: {
+                let raw = env_parse::<u8>("PASSWORD_MIN_STRENGTH", 0);
+                raw.min(4)
+            },
+            presigned_downloads_enabled: matches!(
+                env::var("PRESIGNED_DOWNLOADS_ENABLED").as_deref(),
+                Ok("true" | "1")
+            ),
+            presigned_download_expiry_secs: env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300),
+            smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
+            smtp_port: env_parse("SMTP_PORT", 587),
+            smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
+            smtp_password: env::var("SMTP_PASSWORD").ok().filter(|s| !s.is_empty()),
+            smtp_from_address: env::var("SMTP_FROM_ADDRESS")
+                .unwrap_or_else(|_| "noreply@artifact-keeper.local".into()),
+            smtp_tls_mode: {
+                let mode = env::var("SMTP_TLS_MODE")
+                    .unwrap_or_else(|_| "starttls".into())
+                    .to_lowercase();
+                match mode.as_str() {
+                    "starttls" | "tls" | "none" => mode,
+                    _ => {
+                        tracing::warn!(
+                            value = %mode,
+                            "SMTP_TLS_MODE has an unrecognized value, falling back to \"starttls\""
+                        );
+                        "starttls".into()
+                    }
+                }
             },
         };
 
@@ -435,6 +658,9 @@ mod tests {
         env::remove_var("LOG_LEVEL");
         env::remove_var("STORAGE_BACKEND");
         env::remove_var("DEMO_MODE");
+        env::remove_var("RATE_LIMIT_AUTH_PER_MIN");
+        env::remove_var("RATE_LIMIT_API_PER_MIN");
+        env::remove_var("RATE_LIMIT_WINDOW_SECS");
 
         let config = Config::from_env().expect("Config should load with required vars");
 
@@ -459,6 +685,21 @@ mod tests {
         assert_eq!(config.peer_public_endpoint, "http://localhost:8080");
         assert_eq!(config.max_upload_size_bytes, 10_737_418_240);
 
+        // Database pool defaults (#678)
+        assert_eq!(config.database_max_connections, 20);
+        assert_eq!(config.database_min_connections, 5);
+        assert_eq!(config.database_acquire_timeout_secs, 30);
+        assert_eq!(config.database_idle_timeout_secs, 600);
+        assert_eq!(config.database_max_lifetime_secs, 1800);
+
+        // Password expiration default (disabled)
+        assert_eq!(config.password_expiry_days, 0);
+
+        // Rate limit defaults (#692)
+        assert_eq!(config.rate_limit_auth_per_window, 120);
+        assert_eq!(config.rate_limit_api_per_window, 10000);
+        assert_eq!(config.rate_limit_window_secs, 60);
+
         // Restore
         if let Some(v) = saved_db {
             env::set_var("DATABASE_URL", v);
@@ -481,6 +722,96 @@ mod tests {
         }
         if let Some(v) = saved_demo {
             env::set_var("DEMO_MODE", v);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Database pool configuration (#678)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_database_pool_env_overrides() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_max = env::var("DATABASE_MAX_CONNECTIONS").ok();
+        let saved_min = env::var("DATABASE_MIN_CONNECTIONS").ok();
+        let saved_acq = env::var("DATABASE_ACQUIRE_TIMEOUT_SECS").ok();
+        let saved_idle = env::var("DATABASE_IDLE_TIMEOUT_SECS").ok();
+        let saved_life = env::var("DATABASE_MAX_LIFETIME_SECS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "super-secret");
+        env::set_var("DATABASE_MAX_CONNECTIONS", "50");
+        env::set_var("DATABASE_MIN_CONNECTIONS", "10");
+        env::set_var("DATABASE_ACQUIRE_TIMEOUT_SECS", "15");
+        env::set_var("DATABASE_IDLE_TIMEOUT_SECS", "300");
+        env::set_var("DATABASE_MAX_LIFETIME_SECS", "900");
+
+        let config = Config::from_env().expect("Config should load");
+
+        assert_eq!(config.database_max_connections, 50);
+        assert_eq!(config.database_min_connections, 10);
+        assert_eq!(config.database_acquire_timeout_secs, 15);
+        assert_eq!(config.database_idle_timeout_secs, 300);
+        assert_eq!(config.database_max_lifetime_secs, 900);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        for (k, v) in [
+            ("DATABASE_MAX_CONNECTIONS", saved_max),
+            ("DATABASE_MIN_CONNECTIONS", saved_min),
+            ("DATABASE_ACQUIRE_TIMEOUT_SECS", saved_acq),
+            ("DATABASE_IDLE_TIMEOUT_SECS", saved_idle),
+            ("DATABASE_MAX_LIFETIME_SECS", saved_life),
+        ] {
+            match v {
+                Some(val) => env::set_var(k, val),
+                None => env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn test_config_database_pool_invalid_value_falls_back_to_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_max = env::var("DATABASE_MAX_CONNECTIONS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "super-secret");
+        env::set_var("DATABASE_MAX_CONNECTIONS", "not-a-number");
+
+        let config = Config::from_env().expect("Config should load even with invalid pool setting");
+
+        // env_parse falls back to the default when the value cannot be parsed
+        assert_eq!(config.database_max_connections, 20);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_max {
+            env::set_var("DATABASE_MAX_CONNECTIONS", v);
+        } else {
+            env::remove_var("DATABASE_MAX_CONNECTIONS");
         }
     }
 
@@ -979,6 +1310,186 @@ mod tests {
             env::set_var("MAX_UPLOAD_SIZE", v);
         } else {
             env::remove_var("MAX_UPLOAD_SIZE");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PASSWORD_HISTORY_COUNT
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_password_history_count_default_zero() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_password_history_count_parsed() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "12");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 12);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_invalid_falls_back() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "not-a-number");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 0);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_clamped_to_max_24() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "100");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 24);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_at_max_not_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "24");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 24);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_below_max_not_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "10");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 10);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    // ── presigned downloads config tests ──────────────────────────────
+
+    #[test]
+    fn test_presigned_downloads_disabled_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::remove_var("PRESIGNED_DOWNLOADS_ENABLED");
+        let enabled = matches!(
+            env::var("PRESIGNED_DOWNLOADS_ENABLED").as_deref(),
+            Ok("true" | "1")
+        );
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn test_presigned_downloads_enabled_true() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PRESIGNED_DOWNLOADS_ENABLED", "true");
+        let enabled = matches!(
+            env::var("PRESIGNED_DOWNLOADS_ENABLED").as_deref(),
+            Ok("true" | "1")
+        );
+        assert!(enabled);
+        env::remove_var("PRESIGNED_DOWNLOADS_ENABLED");
+    }
+
+    #[test]
+    fn test_presigned_downloads_enabled_one() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PRESIGNED_DOWNLOADS_ENABLED", "1");
+        let enabled = matches!(
+            env::var("PRESIGNED_DOWNLOADS_ENABLED").as_deref(),
+            Ok("true" | "1")
+        );
+        assert!(enabled);
+        env::remove_var("PRESIGNED_DOWNLOADS_ENABLED");
+    }
+
+    #[test]
+    fn test_presigned_download_expiry_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::remove_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS");
+        let expiry: u64 = env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300);
+        assert_eq!(expiry, 300);
+    }
+
+    #[test]
+    fn test_presigned_download_expiry_custom() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS", "600");
+        let expiry: u64 = env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300);
+        assert_eq!(expiry, 600);
+        env::remove_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS");
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate limit defaults (#692)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_rate_limit_api_default_is_10000() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_rate = env::var("RATE_LIMIT_API_PER_MIN").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::remove_var("RATE_LIMIT_API_PER_MIN");
+
+        let config = Config::from_env().expect("Config should load");
+        assert_eq!(
+            config.rate_limit_api_per_window, 10000,
+            "Default API rate limit should be 10000 after #692 fix"
+        );
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_rate {
+            Some(v) => env::set_var("RATE_LIMIT_API_PER_MIN", v),
+            None => env::remove_var("RATE_LIMIT_API_PER_MIN"),
+        }
+    }
+
+    #[test]
+    fn test_config_rate_limit_api_env_override() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_rate = env::var("RATE_LIMIT_API_PER_MIN").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("RATE_LIMIT_API_PER_MIN", "25000");
+
+        let config = Config::from_env().expect("Config should load");
+        assert_eq!(config.rate_limit_api_per_window, 25000);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_rate {
+            Some(v) => env::set_var("RATE_LIMIT_API_PER_MIN", v),
+            None => env::remove_var("RATE_LIMIT_API_PER_MIN"),
         }
     }
 }

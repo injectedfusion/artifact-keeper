@@ -768,6 +768,37 @@ mod tests {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             metrics_port: None,
+            database_max_connections: 20,
+            database_min_connections: 5,
+            database_acquire_timeout_secs: 30,
+            database_idle_timeout_secs: 600,
+            database_max_lifetime_secs: 1800,
+            rate_limit_auth_per_window: 120,
+            rate_limit_api_per_window: 5000,
+            rate_limit_window_secs: 60,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
+            account_lockout_threshold: 5,
+            account_lockout_duration_minutes: 30,
+            quarantine_enabled: false,
+            quarantine_duration_minutes: 60,
+            password_history_count: 0,
+            password_expiry_days: 0,
+            password_min_length: 8,
+            password_max_length: 128,
+            password_require_uppercase: false,
+            password_require_lowercase: false,
+            password_require_digit: false,
+            password_require_special: false,
+            password_min_strength: 0,
+            presigned_downloads_enabled: false,
+            presigned_download_expiry_secs: 300,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from_address: "noreply@artifact-keeper.local".to_string(),
+            smtp_tls_mode: "starttls".to_string(),
         }
     }
 
@@ -822,5 +853,84 @@ mod tests {
             result.is_ok(),
             "StorageService::from_config should succeed with storage_backend=gcs"
         );
+    }
+
+    // ── presigned URL support tests (via crate::storage::StorageBackend) ──
+
+    use crate::storage::{PresignedUrl, PresignedUrlSource};
+
+    /// A mock backend implementing `crate::storage::StorageBackend` with
+    /// presigned URL support.
+    struct MockPresignedInner;
+
+    #[async_trait]
+    impl crate::storage::StorageBackend for MockPresignedInner {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> Result<Bytes> {
+            Ok(Bytes::from_static(b"mock"))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        fn supports_redirect(&self) -> bool {
+            true
+        }
+        async fn get_presigned_url(
+            &self,
+            key: &str,
+            expires_in: std::time::Duration,
+        ) -> Result<Option<PresignedUrl>> {
+            Ok(Some(PresignedUrl {
+                url: format!("https://mock.example.com/{}", key),
+                expires_in,
+                source: PresignedUrlSource::S3,
+            }))
+        }
+    }
+
+    #[test]
+    fn test_filesystem_storage_does_not_support_redirect() {
+        let backend = crate::storage::filesystem::FilesystemStorage::new("/tmp/test-artifacts");
+        assert!(!crate::storage::StorageBackend::supports_redirect(&backend));
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_storage_presigned_url_returns_none() {
+        let backend = crate::storage::filesystem::FilesystemStorage::new("/tmp/test-artifacts");
+        let result = crate::storage::StorageBackend::get_presigned_url(
+            &backend,
+            "test-key",
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_mock_presigned_inner_supports_redirect() {
+        let backend = MockPresignedInner;
+        assert!(crate::storage::StorageBackend::supports_redirect(&backend));
+    }
+
+    #[tokio::test]
+    async fn test_mock_presigned_inner_returns_url() {
+        let backend = MockPresignedInner;
+        let result = crate::storage::StorageBackend::get_presigned_url(
+            &backend,
+            "test-key",
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_some());
+        let presigned = result.unwrap();
+        assert!(presigned.url.contains("test-key"));
+        assert_eq!(presigned.source, PresignedUrlSource::S3);
     }
 }
