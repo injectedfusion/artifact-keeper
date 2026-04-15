@@ -603,10 +603,28 @@ async fn execute_chunked_transfer(
     let chunk_ranges = compute_chunk_ranges(task.artifact_size, chunk_size);
     let mut bytes_transferred: i64 = 0;
 
+    // Open the source file once and reuse it across every chunk. Repeatedly
+    // opening the file per chunk (as the original implementation did) adds
+    // significant filesystem overhead for large artifacts.
+    let storage_path = std::env::var("STORAGE_PATH")
+        .unwrap_or_else(|_| "/var/lib/artifact-keeper/artifacts".into());
+    let full_path = std::path::PathBuf::from(&storage_path).join(&task.storage_key);
+    let mut storage_file = match tokio::fs::File::open(&full_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            let msg = format!(
+                "Failed to open storage file '{}': {e}",
+                full_path.display()
+            );
+            handle_transfer_failure(db, task, &msg).await;
+            return Err(msg);
+        }
+    };
+
     for (chunk_index, byte_offset, byte_length) in &chunk_ranges {
-        // Read just this chunk from storage.
-        let chunk_data = match read_artifact_chunk_from_storage(
-            &task.storage_key,
+        // Read just this chunk from the already-open file handle.
+        let chunk_data = match read_chunk_from_open_file(
+            &mut storage_file,
             *byte_offset as u64,
             *byte_length as usize,
         )
@@ -803,29 +821,23 @@ async fn read_artifact_from_storage(_db: &PgPool, storage_key: &str) -> Result<V
 ///
 /// Seeks to `offset` and reads exactly `length` bytes.  Used by the chunked
 /// transfer path to avoid loading the entire artifact into memory.
-async fn read_artifact_chunk_from_storage(
-    storage_key: &str,
+/// Seek + read a chunk from an already-open file handle. Caller owns the
+/// file so the open syscall happens once per transfer, not once per chunk.
+async fn read_chunk_from_open_file(
+    file: &mut tokio::fs::File,
     offset: u64,
     length: usize,
 ) -> Result<Vec<u8>, String> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    let storage_path = std::env::var("STORAGE_PATH")
-        .unwrap_or_else(|_| "/var/lib/artifact-keeper/artifacts".into());
-    let full_path = std::path::PathBuf::from(&storage_path).join(storage_key);
-
-    let mut file = tokio::fs::File::open(&full_path)
-        .await
-        .map_err(|e| format!("Failed to open '{}': {e}", full_path.display()))?;
-
     file.seek(std::io::SeekFrom::Start(offset))
         .await
-        .map_err(|e| format!("Failed to seek in '{}': {e}", full_path.display()))?;
+        .map_err(|e| format!("Failed to seek to offset {offset}: {e}"))?;
 
     let mut buf = vec![0u8; length];
     file.read_exact(&mut buf)
         .await
-        .map_err(|e| format!("Failed to read chunk from '{}': {e}", full_path.display()))?;
+        .map_err(|e| format!("Failed to read {length} bytes at offset {offset}: {e}"))?;
 
     Ok(buf)
 }

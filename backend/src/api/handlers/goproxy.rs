@@ -20,8 +20,11 @@ use axum::routing::get;
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use reqwest::Client;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::sync::OnceLock;
+use std::time::Duration;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
@@ -228,18 +231,47 @@ async fn handle_get(
 // GET sumdb/... — Proxy to upstream checksum database
 // ---------------------------------------------------------------------------
 
+/// Allowed sumdb upstream hosts. Prevents SSRF via the `{host}` path segment.
+const ALLOWED_SUMDB_HOSTS: &[&str] = &["sum.golang.org"];
+
+/// Shared `reqwest::Client` for sumdb proxy calls. Built once to reuse
+/// the connection pool instead of reconstructing per request.
+fn sumdb_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build sumdb reqwest client")
+    })
+}
+
+/// Returns true when `host` is on the sumdb proxy allowlist.
+fn is_sumdb_host_allowed(host: &str) -> bool {
+    ALLOWED_SUMDB_HOSTS.contains(&host)
+}
+
 /// Proxy a sumdb request to the upstream checksum database.
 ///
 /// The Go toolchain performs go.sum verification by querying
 /// `$GOPROXY/sumdb/sum.golang.org/{path}`. We forward these requests
-/// to `https://{host}/{path}` (defaulting to sum.golang.org).
+/// to `https://{host}/{path}` only when `{host}` is in `ALLOWED_SUMDB_HOSTS`
+/// to prevent SSRF against internal services or cloud metadata endpoints.
 async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
+    if !is_sumdb_host_allowed(host) {
+        tracing::warn!("Rejected sumdb request to unauthorized host: {}", host);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("sumdb host not allowed: {}", host),
+        )
+            .into_response());
+    }
+
     let url = format!("https://{}/{}", host, path);
 
     tracing::debug!("Proxying sumdb request to {}", url);
 
-    let client = reqwest::Client::new();
-    let upstream_resp = client.get(&url).send().await.map_err(|e| {
+    let upstream_resp = sumdb_client().get(&url).send().await.map_err(|e| {
         tracing::warn!("sumdb proxy request failed for {}: {}", url, e);
         (
             StatusCode::BAD_GATEWAY,
@@ -1414,6 +1446,27 @@ mod tests {
     #[test]
     fn test_parse_sumdb_only_prefix_returns_error() {
         assert!(parse_path("sumdb/").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // SSRF allowlist — is_sumdb_host_allowed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sumdb_host_allowlist_accepts_sum_golang_org() {
+        assert!(super::is_sumdb_host_allowed("sum.golang.org"));
+    }
+
+    #[test]
+    fn test_sumdb_host_allowlist_rejects_attacker_hosts() {
+        // Cloud metadata, loopback, and arbitrary internal hosts must be
+        // rejected. The `host` segment comes straight from the URL path.
+        assert!(!super::is_sumdb_host_allowed("169.254.169.254"));
+        assert!(!super::is_sumdb_host_allowed("localhost"));
+        assert!(!super::is_sumdb_host_allowed("127.0.0.1"));
+        assert!(!super::is_sumdb_host_allowed("metadata.google.internal"));
+        assert!(!super::is_sumdb_host_allowed("internal.service"));
+        assert!(!super::is_sumdb_host_allowed(""));
     }
 
     // -----------------------------------------------------------------------

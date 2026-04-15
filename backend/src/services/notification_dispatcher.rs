@@ -6,13 +6,35 @@
 //! table. Subscriptions whose event_types array contains the event type (and
 //! whose repository_id matches, if set) trigger a delivery attempt.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use reqwest::Client;
 use sqlx::{PgPool, Row};
 use tokio::sync::broadcast;
 
 use crate::services::event_bus::{DomainEvent, EventBus};
 use crate::services::smtp_service::SmtpService;
+
+/// Shared `reqwest::Client` for webhook deliveries. Built once so every
+/// webhook POST reuses the same connection pool.
+fn webhook_client() -> Option<&'static Client> {
+    static CLIENT: OnceLock<Option<Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            crate::services::http_client::base_client_builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|e| {
+                    tracing::error!(
+                        error = %e,
+                        "Failed to build shared webhook HTTP client at startup"
+                    );
+                    e
+                })
+                .ok()
+        })
+        .as_ref()
+}
 
 /// Maps a domain event type (e.g. "artifact.created") to the notification
 /// event type used in subscription filters (e.g. "artifact.uploaded").
@@ -298,16 +320,12 @@ async fn deliver_webhook(
 
     let payload = build_webhook_payload(event);
 
-    let client = match crate::services::http_client::base_client_builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
+    let client = match webhook_client() {
+        Some(c) => c,
+        None => {
             tracing::warn!(
                 subscription_id = %subscription_id,
-                error = %e,
-                "Failed to build HTTP client for webhook delivery"
+                "Webhook HTTP client unavailable (build failed at startup); skipping delivery"
             );
             return;
         }

@@ -114,18 +114,28 @@ pub fn status_after_scan(has_findings: bool) -> QuarantineState {
 // Database helpers (I/O layer)
 // ---------------------------------------------------------------------------
 
+/// Read the global quarantine defaults from environment variables.
+///
+/// Single source of truth for env parsing; shared by [`Config::from_env`] and
+/// [`resolve_config`] so they cannot drift. Tests can override via
+/// `QUARANTINE_ENABLED` / `QUARANTINE_DURATION_MINUTES`.
+pub fn global_defaults_from_env() -> (bool, i64) {
+    let enabled = matches!(
+        std::env::var("QUARANTINE_ENABLED").as_deref(),
+        Ok("true" | "1")
+    );
+    let duration: i64 = std::env::var("QUARANTINE_DURATION_MINUTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_DURATION_MINUTES);
+    (enabled, duration)
+}
+
 /// Resolve the effective quarantine config for a repository.
 ///
 /// Checks `repository_config` first, then falls back to env vars, then defaults.
 pub async fn resolve_config(db: &PgPool, repository_id: Uuid) -> QuarantineConfig {
-    let global_enabled = matches!(
-        std::env::var("QUARANTINE_ENABLED").as_deref(),
-        Ok("true" | "1")
-    );
-    let global_duration: i64 = std::env::var("QUARANTINE_DURATION_MINUTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_DURATION_MINUTES);
+    let (global_enabled, global_duration) = global_defaults_from_env();
 
     // Try per-repo overrides from repository_config
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(

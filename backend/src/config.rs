@@ -421,11 +421,14 @@ impl Config {
             ),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
-            quarantine_enabled: matches!(
-                env::var("QUARANTINE_ENABLED").as_deref(),
-                Ok("true" | "1")
-            ),
-            quarantine_duration_minutes: env_parse("QUARANTINE_DURATION_MINUTES", 60).max(1),
+            quarantine_enabled: {
+                let (enabled, _) = crate::services::quarantine_service::global_defaults_from_env();
+                enabled
+            },
+            quarantine_duration_minutes: {
+                let (_, duration) = crate::services::quarantine_service::global_defaults_from_env();
+                duration.max(1)
+            },
             password_history_count: env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24),
             password_expiry_days: env_parse("PASSWORD_EXPIRY_DAYS", 0).min(3650),
             password_min_length: env_parse("PASSWORD_MIN_LENGTH", 8),
