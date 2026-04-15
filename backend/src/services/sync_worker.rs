@@ -612,10 +612,7 @@ async fn execute_chunked_transfer(
     let mut storage_file = match tokio::fs::File::open(&full_path).await {
         Ok(f) => f,
         Err(e) => {
-            let msg = format!(
-                "Failed to open storage file '{}': {e}",
-                full_path.display()
-            );
+            let msg = format!("Failed to open storage file '{}': {e}", full_path.display());
             handle_transfer_failure(db, task, &msg).await;
             return Err(msg);
         }
