@@ -229,6 +229,7 @@ async fn download_pod(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

@@ -272,6 +272,7 @@ async fn download_module(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 
@@ -821,6 +822,7 @@ async fn download_provider(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

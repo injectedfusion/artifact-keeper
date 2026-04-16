@@ -527,6 +527,7 @@ async fn flatcontainer_download(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

@@ -1743,6 +1743,7 @@ pub async fn download_artifact(
                             .await
                     }
                 },
+                None,
             )
             .await
             .map_err(|_| {

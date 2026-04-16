@@ -230,6 +230,7 @@ async fn download_plugin(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

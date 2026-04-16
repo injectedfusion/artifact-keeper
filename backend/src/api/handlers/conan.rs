@@ -582,6 +582,7 @@ async fn recipe_file_download(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 
@@ -1049,6 +1050,7 @@ async fn package_file_download(
                                 .await
                             }
                         },
+                        None,
                     )
                     .await?;
 

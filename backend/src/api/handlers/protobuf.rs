@@ -1353,6 +1353,7 @@ async fn download(
                                 .await
                             }
                         },
+                        None,
                     )
                     .await?;
 

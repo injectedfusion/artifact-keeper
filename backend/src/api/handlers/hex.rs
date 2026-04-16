@@ -258,6 +258,7 @@ async fn download_tarball(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

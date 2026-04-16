@@ -342,12 +342,27 @@ pub async fn proxy_fetch_uncached(
 ///
 /// `local_fetch` should attempt to load from local storage for a given repo_id.
 /// Returns the first successful result, or the last error.
+/// Optional context for registering proxied artifacts for scanning.
+///
+/// When `Some`, [`resolve_virtual_download`] calls [`register_proxied_artifact`]
+/// after a successful remote proxy fetch. When `None`, registration is skipped
+/// (appropriate for metadata endpoints that aren't scannable).
+pub struct VirtualScanCtx {
+    pub db: PgPool,
+    pub scanner_service: Option<Arc<ScannerService>>,
+    pub storage_registry: Arc<StorageRegistry>,
+    pub artifact_name: String,
+    pub artifact_version: String,
+    pub content_type: Option<String>,
+}
+
 pub async fn resolve_virtual_download<F, Fut>(
     db: &PgPool,
     proxy_service: Option<&ProxyService>,
     virtual_repo_id: Uuid,
     path: &str,
     local_fetch: F,
+    scan_ctx: Option<VirtualScanCtx>,
 ) -> Result<(Bytes, Option<String>), Response>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
@@ -373,6 +388,21 @@ where
                 if let Ok(result) =
                     proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await
                 {
+                    // Register the proxied artifact for scanning when context is provided.
+                    if let Some(ref ctx) = scan_ctx {
+                        register_proxied_artifact(ProxiedArtifact {
+                            db: ctx.db.clone(),
+                            scanner_service: ctx.scanner_service.clone(),
+                            storage_registry: ctx.storage_registry.clone(),
+                            repo_id: member.id,
+                            repo_key: member.key.clone(),
+                            artifact_path: path.to_string(),
+                            name: ctx.artifact_name.clone(),
+                            version: ctx.artifact_version.clone(),
+                            content: result.0.clone(),
+                            content_type: ctx.content_type.clone(),
+                        });
+                    }
                     return Ok(result);
                 }
             }

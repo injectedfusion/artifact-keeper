@@ -532,6 +532,11 @@ async fn serve_tarball(
     if repo.repo_type == RepositoryType::Virtual {
         let db = state.db.clone();
         let fname = filename.to_string();
+        let version_str = filename
+            .strip_suffix(".tgz")
+            .and_then(|s| s.rsplit_once('-'))
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default();
         let (content, content_type) = proxy_helpers::resolve_virtual_download(
             &state.db,
             state.proxy_service.as_deref(),
@@ -548,6 +553,14 @@ async fn serve_tarball(
                     .await
                 }
             },
+            Some(proxy_helpers::VirtualScanCtx {
+                db: state.db.clone(),
+                scanner_service: state.scanner_service.clone(),
+                storage_registry: state.storage_registry.clone(),
+                artifact_name: package_name.to_string(),
+                artifact_version: version_str,
+                content_type: Some("application/gzip".to_string()),
+            }),
         )
         .await?;
 
@@ -635,6 +648,11 @@ async fn serve_tarball(
                 let db = state.db.clone();
                 let fname = filename.to_string();
                 let upstream_path = format!("{}/-/{}", package_name, filename);
+                let version_str = filename
+                    .strip_suffix(".tgz")
+                    .and_then(|s| s.rsplit_once('-'))
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default();
                 let (content, content_type) = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
@@ -651,6 +669,14 @@ async fn serve_tarball(
                             .await
                         }
                     },
+                    Some(proxy_helpers::VirtualScanCtx {
+                        db: state.db.clone(),
+                        scanner_service: state.scanner_service.clone(),
+                        storage_registry: state.storage_registry.clone(),
+                        artifact_name: package_name.to_string(),
+                        artifact_version: version_str,
+                        content_type: Some("application/gzip".to_string()),
+                    }),
                 )
                 .await?;
 

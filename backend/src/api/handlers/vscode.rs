@@ -223,6 +223,7 @@ async fn download_vsix(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

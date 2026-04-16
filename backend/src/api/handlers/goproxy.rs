@@ -616,6 +616,7 @@ async fn get_mod_file(
                             .await
                         }
                     },
+                    None, // go.mod is metadata, not a scannable artifact
                 )
                 .await?;
 
@@ -774,6 +775,14 @@ async fn download_zip(
                             .await
                         }
                     },
+                    Some(proxy_helpers::VirtualScanCtx {
+                        db: state.db.clone(),
+                        scanner_service: state.scanner_service.clone(),
+                        storage_registry: state.storage_registry.clone(),
+                        artifact_name: module.to_string(),
+                        artifact_version: version.to_string(),
+                        content_type: Some("application/zip".to_string()),
+                    }),
                 )
                 .await?;
 

@@ -632,6 +632,7 @@ async fn download_object(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 
