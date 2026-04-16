@@ -630,6 +630,7 @@ async fn pool_download(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

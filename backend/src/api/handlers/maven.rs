@@ -637,6 +637,7 @@ async fn serve_artifact(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

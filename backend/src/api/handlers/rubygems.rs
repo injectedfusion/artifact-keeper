@@ -321,6 +321,7 @@ async fn download_gem(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

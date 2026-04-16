@@ -298,6 +298,7 @@ async fn download_chart(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

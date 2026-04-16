@@ -297,6 +297,7 @@ async fn download_file(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

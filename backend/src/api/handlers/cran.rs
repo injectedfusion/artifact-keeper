@@ -269,6 +269,7 @@ async fn download_package(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

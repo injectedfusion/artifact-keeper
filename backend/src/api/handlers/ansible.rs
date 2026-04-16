@@ -455,6 +455,7 @@ async fn download_collection(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

@@ -413,6 +413,7 @@ async fn download_module(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

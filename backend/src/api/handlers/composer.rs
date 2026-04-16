@@ -431,6 +431,7 @@ async fn download_archive(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 

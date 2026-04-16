@@ -733,6 +733,14 @@ async fn download(
                             .await
                         }
                     },
+                    Some(proxy_helpers::VirtualScanCtx {
+                        db: state.db.clone(),
+                        scanner_service: state.scanner_service.clone(),
+                        storage_registry: state.storage_registry.clone(),
+                        artifact_name: name_lower.clone(),
+                        artifact_version: version.clone(),
+                        content_type: Some("application/gzip".to_string()),
+                    }),
                 )
                 .await?;
 

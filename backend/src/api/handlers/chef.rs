@@ -343,6 +343,7 @@ async fn download_cookbook(
                             .await
                         }
                     },
+                    None,
                 )
                 .await?;
 
