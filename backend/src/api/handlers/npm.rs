@@ -503,6 +503,20 @@ async fn serve_tarball(
     let encoded_name = encode_package_name_for_upstream(package_name);
     let upstream_path = format!("{}/-/{}", encoded_name, filename);
 
+    // Extract version from tarball filename once. Strip the package base name
+    // (without scope) and leading hyphen, then strip .tgz suffix. This handles
+    // pre-release versions with hyphens (e.g., 1.0.0-beta.1) correctly.
+    let pkg_base_name = package_name
+        .rsplit_once('/')
+        .map(|(_, n)| n)
+        .unwrap_or(package_name);
+    let version_from_filename = filename
+        .strip_suffix(".tgz")
+        .and_then(|s| s.strip_prefix(pkg_base_name))
+        .and_then(|s| s.strip_prefix('-'))
+        .unwrap_or("")
+        .to_string();
+
     // For remote repos, always proxy tarballs from upstream (hits cache if
     // already fetched). The proxy cache stores content under its own storage
     // key which the regular artifact storage cannot resolve.
@@ -532,11 +546,6 @@ async fn serve_tarball(
     if repo.repo_type == RepositoryType::Virtual {
         let db = state.db.clone();
         let fname = filename.to_string();
-        let version_str = filename
-            .strip_suffix(".tgz")
-            .and_then(|s| s.rsplit_once('-'))
-            .map(|(_, v)| v.to_string())
-            .unwrap_or_default();
         let (content, content_type) = proxy_helpers::resolve_virtual_download(
             &state.db,
             state.proxy_service.as_deref(),
@@ -558,7 +567,7 @@ async fn serve_tarball(
                 scanner_service: state.scanner_service.clone(),
                 storage_registry: state.storage_registry.clone(),
                 artifact_name: package_name.to_string(),
-                artifact_version: version_str,
+                artifact_version: version_from_filename.clone(),
                 content_type: Some("application/gzip".to_string()),
             }),
         )
@@ -622,11 +631,7 @@ async fn serve_tarball(
                         repo_key: repo_key.to_string(),
                         artifact_path: upstream_path.clone(),
                         name: package_name.to_string(),
-                        version: filename
-                            .strip_suffix(".tgz")
-                            .and_then(|s| s.rsplit_once('-'))
-                            .map(|(_, v)| v.to_string())
-                            .unwrap_or_default(),
+                        version: version_from_filename.clone(),
                         content: content.clone(),
                         content_type: Some("application/gzip".to_string()),
                     });
@@ -648,11 +653,6 @@ async fn serve_tarball(
                 let db = state.db.clone();
                 let fname = filename.to_string();
                 let upstream_path = format!("{}/-/{}", package_name, filename);
-                let version_str = filename
-                    .strip_suffix(".tgz")
-                    .and_then(|s| s.rsplit_once('-'))
-                    .map(|(_, v)| v.to_string())
-                    .unwrap_or_default();
                 let (content, content_type) = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
@@ -674,7 +674,7 @@ async fn serve_tarball(
                         scanner_service: state.scanner_service.clone(),
                         storage_registry: state.storage_registry.clone(),
                         artifact_name: package_name.to_string(),
-                        artifact_version: version_str,
+                        artifact_version: version_from_filename.clone(),
                         content_type: Some("application/gzip".to_string()),
                     }),
                 )
